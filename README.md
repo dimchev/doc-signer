@@ -2,6 +2,13 @@
 
 A small desktop application (Rust + egui) for digitally signing PDF documents — without Adobe. Runs on **Windows** and **Linux**.
 
+## Downloads
+
+Prebuilt binaries (built from `master` by GitHub Actions) are on the [Releases page](https://github.com/dimchev/doc-signer/releases):
+
+- **Windows x64** — `doc-signer-windows-x64.zip`: unzip and run `doc-signer.exe` (`pdfium.dll` is included for the page preview).
+- **Linux x64** — `doc-signer-linux-x64.tar.gz`: extract and run `./doc-signer`. Needs the GTK3 and X11 system libraries (e.g. `sudo apt install libgtk-3-0 libx11-6`); `libpdfium.so` is included for the page preview.
+
 ## Features
 
 - Sign one or many PDF files (button, `Ctrl+O`, drag & drop of files or a folder, or command-line arguments).
