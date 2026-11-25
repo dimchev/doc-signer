@@ -7,7 +7,6 @@ on:
 
 jobs:
   test-linux:
-    name: test-linux
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,24 +29,27 @@ jobs:
 
       - name: Prepare test data
         run: |
-          mkdir -p ci-certs
-          # Minimal 1-page test PDF (fixture).
-          echo 'JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgPj4gPj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA1NSA+PgpzdHJlYW0KQlQgL0YxIDI0IFRmIDcyIDcyMCBUZCAoRG9jIFNpZ25lciB0ZXN0IGRvY3VtZW50KSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL1R5cGUgL1ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNDEgMDAwMDAgbiAKMDAwMDAwMDM0NiAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDYgL1Jvb3QgMSAwIFIgPj4Kc3RhcnR4cmVmCjQxNgolJUVPRgo=' | base64 -d > test.pdf
-          # Self-signed cert with the Microsoft document-signing EKU, unencrypted key.
+          set -euo pipefail
+          mkdir -p ci-test/certs
+          # Known-good minimal 1-page PDF fixture
+          echo 'JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvQ29udGVudHMgNCAwIFIgL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgNSAwIFIgPj4gPj4gPj4KZW5kb2JqCjQgMCBvYmoKPDwgL0xlbmd0aCA1NSA+PgpzdHJlYW0KQlQgL0YxIDI0IFRmIDcyIDcyMCBUZCAoRG9jIFNpZ25lciB0ZXN0IGRvY3VtZW50KSBUaiBFVAplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNDEgMDAwMDAgbiAKMDAwMDAwMDM0NiAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDYgL1Jvb3QgMSAwIFIgPj4Kc3RhcnR4cmVmCjQxNgolJUVPRgo=' | base64 -d > ci-test/test.pdf
+          # Self-signed certificate with the MS document-signing EKU
           openssl req -new -x509 -newkey rsa:2048 -nodes \
-            -keyout ci-certs/ci.key -out ci-certs/ci.crt -days 30 \
-            -subj "/CN=Doc Signer CI/O=Acme" \
+            -keyout ci-test/certs/ci.key -out ci-test/certs/ci.crt \
+            -days 30 -subj "/CN=Doc Signer CI/O=Acme" \
             -addext "extendedKeyUsage=1.3.6.1.4.1.311.10.3.12,1.3.6.1.5.5.7.3.3"
-          THUMB=$(openssl x509 -in ci-certs/ci.crt -outform der | openssl sha1 | awk '{print $NF}' | tr '[:lower:]' '[:upper:]')
-          echo "DOC_SIGNER_CERTS_DIR=$GITHUB_WORKSPACE/ci-certs" >> "$GITHUB_ENV"
-          echo "DOC_SIGNER_TEST_PDF=$GITHUB_WORKSPACE/test.pdf" >> "$GITHUB_ENV"
-          echo "DOC_SIGNER_THUMB=$THUMB" >> "$GITHUB_ENV"
+          THUMB=$(openssl x509 -in ci-test/certs/ci.crt -outform der | openssl sha1 | awk '{print $NF}' | tr '[:lower:]' '[:upper:]')
+          {
+            echo "DOC_SIGNER_CERTS_DIR=$GITHUB_WORKSPACE/ci-test/certs"
+            echo "DOC_SIGNER_TEST_PDF=$GITHUB_WORKSPACE/ci-test/test.pdf"
+            echo "DOC_SIGNER_THUMB=$THUMB"
+          } >> "$GITHUB_ENV"
+          echo "Test cert thumbprint: $THUMB"
 
-      - name: Run tests (including e2e with real signing)
-        run: cargo test --release -- --include-ignored --nocapture
+      - name: Run tests
+        run: cargo test -- --include-ignored --nocapture
 
   test-windows:
-    name: test-windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,12 +59,13 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            ~\AppData\Local\cargo\registry
+            ~\AppData\Local\cargo\registry\index
+            ~\AppData\Local\cargo\registry\cache
             ~\AppData\Local\cargo\git
             target
           key: cargo-windows-${{ hashFiles('Cargo.lock') }}
 
-      # The e2e signing test skips when the DOC_SIGNER_* env vars are not set
-      # (CNG signing needs a store certificate, not a PEM file).
+      # e2e signing test auto-skips here (no certificate in the store);
+      # unit tests (CMS encoder, PDF incremental update) still run.
       - name: Run tests
         run: cargo test --release
