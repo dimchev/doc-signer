@@ -1,0 +1,21 @@
+[package]
+name = "doc-signer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ab_glyph = "0.2.32"
+anyhow = "1.0.104"
+chrono = "0.4.45"
+eframe = "0.37.0"
+flate2 = "1.1.11"
+lopdf = "0.47.0"
+pdfium-render = "0.9.5"
+rfd = "0.18.0"
+sha2 = "0.11.1"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_Globalization"] }
+
+[target.'cfg(not(windows))'.dependencies]
+openssl = "0.10"
