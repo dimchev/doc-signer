@@ -19,7 +19,7 @@ fn load(names: &[&str]) -> Option<FontVec> {
         #[cfg(windows)]
         {
             let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-            names.iter().find_map(|n| std::fs::read(format!("{dir}\\Fonts\\{n}"))).ok()
+            names.iter().find_map(|n| std::fs::read(format!("{dir}\\Fonts\\{n}")).ok())
         }
         #[cfg(not(windows))]
         {
