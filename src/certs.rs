@@ -424,8 +424,16 @@ mod nix {
     }
 
     fn iter_entries() -> Result<Vec<(PathBuf, Entry)>> {
-        let dir = certs_dir();
-        let rd = std::fs::read_dir(&dir).with_context(|| format!("{}: {}", t().err_store, dir.display()))?;
+        scan_dir(&certs_dir())
+    }
+
+    fn scan_dir(dir: &std::path::Path) -> Result<Vec<(PathBuf, Entry)>> {
+        // A missing folder means "no certificates yet", not an error.
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e).with_context(|| format!("{}: {}", t().err_store, dir.display())),
+        };
         let mut out = Vec::new();
         for e in rd.flatten() {
             let path = e.path();
@@ -501,7 +509,11 @@ mod nix {
     fn find(thumbprint: &[u8]) -> Result<Entry> {
         let mut last_err: Option<(PathBuf, anyhow::Error)> = None;
         let dir = certs_dir();
-        let rd = std::fs::read_dir(&dir).with_context(|| format!("{}: {}", t().err_store, dir.display()))?;
+        let rd = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(anyhow!("{}", t().err_cert_not_found)),
+            Err(e) => return Err(e).with_context(|| format!("{}: {}", t().err_store, dir.display())),
+        };
         for e in rd.flatten() {
             let path = e.path();
             if !is_cert_file(&path) {
@@ -527,6 +539,17 @@ mod nix {
     /// Signs the SHA-256 of `data` with the certificate's private key.
     pub fn sign_digest(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>> {
         find(thumbprint)?.sign(data, alg)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn missing_dir_is_empty_not_error() {
+            let dir = std::path::Path::new("/nonexistent-doc-signer-certs-test-xyz");
+            assert!(scan_dir(dir).expect("missing dir is not an error").is_empty());
+        }
     }
 }
 

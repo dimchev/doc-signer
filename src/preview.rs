@@ -1,4 +1,4 @@
-//! Optional page rendering via pdfium.dll (if present next to the exe).
+//! Optional page rendering via pdfium (pdfium.dll on Windows, libpdfium.so on Linux, if present next to the exe).
 
 use std::path::{Path, PathBuf};
 
@@ -44,3 +44,5 @@ impl Previewer {
         Ok(ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
     }
 }
+
+
