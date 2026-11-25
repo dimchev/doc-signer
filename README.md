@@ -90,3 +90,13 @@ cargo test -- --include-ignored
 - [lopdf](https://github.com/lopdf/lopdf) — PDF parsing.
 - [egui / eframe](https://github.com/emilk/egui) — GUI.
 - [openssl](https://github.com/rust-openssl/openssl) (Linux) — certificate and key handling.
+
+## License
+
+Licensed under either of
+
+- MIT License ([LICENSE-MIT](LICENSE-MIT))
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+
+at your option.
+
