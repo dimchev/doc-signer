@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::ptr::null_mut;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, TimeZone};
 use sha2::Digest;
 use windows::Win32::Security::Cryptography::*;
 use windows::core::w;
@@ -183,9 +183,9 @@ pub fn sign_digest(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8
             KeyAlg::Ecdsa => (None, NCRYPT_FLAGS(0)),
         };
         let mut len = 0u32;
-        let result = NCryptSignHash(hkey, pad_ptr, digest, None, &mut len, flags).and_then(|_| {
+        let result = NCryptSignHash(hkey, pad_ptr, &digest, None, &mut len, flags).and_then(|_| {
             let mut sig = vec![0u8; len as usize];
-            NCryptSignHash(hkey, pad_ptr, digest, Some(&mut sig), &mut len, flags).map(|_| {
+            NCryptSignHash(hkey, pad_ptr, &digest, Some(&mut sig), &mut len, flags).map(|_| {
                 sig.truncate(len as usize);
                 sig
             })
