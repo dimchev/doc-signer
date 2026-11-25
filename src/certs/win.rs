@@ -2,6 +2,8 @@ use std::ffi::c_void;
 use std::ptr::null_mut;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chrono::{DateTime, Local};
+use sha2::Digest;
 use windows::Win32::Security::Cryptography::*;
 use windows::core::w;
 
