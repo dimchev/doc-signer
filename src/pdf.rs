@@ -535,6 +535,9 @@ mod tests {
     /// End-to-end with a real certificate from the user's store (Windows) or
     /// certificate folder (Linux):
     /// `DOC_SIGNER_TEST_PDF=in.pdf DOC_SIGNER_THUMB=<sha1> cargo test -- --include-ignored`
+    ///
+    /// Optional overrides: `DOC_SIGNER_NAME`, `DOC_SIGNER_REASON`, `DOC_SIGNER_LOCATION`,
+    /// `DOC_SIGNER_CONTACT`, `DOC_SIGNER_RECT="x y w h"` (points), `DOC_SIGNER_PAGE` (0-based).
     #[test]
     #[ignore]
     fn signs_with_real_certificate() {
@@ -545,13 +548,22 @@ mod tests {
         let signer = crate::certs::load_signer(&thumb).unwrap();
         let bytes = std::fs::read(&input).unwrap();
         let info = inspect(&bytes).unwrap();
+        let env_or = |k: &str, d: String| std::env::var(k).unwrap_or(d);
+        let (page, rect) = match std::env::var("DOC_SIGNER_RECT").ok() {
+            Some(s) => {
+                let r: Vec<f32> = s.split_whitespace().map(|p| p.parse().unwrap()).collect();
+                let page = std::env::var("DOC_SIGNER_PAGE").ok().and_then(|p| p.parse().ok()).unwrap_or(info.pages.len() - 1);
+                (page, [r[0], r[1], r[2], r[3]])
+            }
+            None => (info.pages.len() - 1, [300.0, 600.0, 190.0, 62.0]),
+        };
         let req = SignRequest {
-            signer_name: "Test Signer".into(),
-            reason: "Approved".into(),
-            location: "Testville".into(),
-            contact: String::new(),
+            signer_name: env_or("DOC_SIGNER_NAME", "Test Signer".into()),
+            reason: env_or("DOC_SIGNER_REASON", "Approved".into()),
+            location: env_or("DOC_SIGNER_LOCATION", "Testville".into()),
+            contact: env_or("DOC_SIGNER_CONTACT", String::new()),
             time: chrono::Local::now(),
-            visible: Some(Visible { page: info.pages.len() - 1, rect: [300.0, 600.0, 190.0, 62.0] }),
+            visible: Some(Visible { page, rect }),
         };
         let out = sign_pdf(&bytes, &req, &signer, &|d| crate::certs::sign_digest(&thumb, d, signer.alg)).unwrap();
         std::fs::write(format!("{input}.signed.pdf"), &out).unwrap();

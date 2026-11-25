@@ -23,11 +23,17 @@ fn load(names: &[&str]) -> Option<FontVec> {
         }
         #[cfg(not(windows))]
         {
+            // Debian/Ubuntu keep fonts under truetype/, Arch (and friends) directly under /usr/share/fonts.
+            let roots = ["/usr/share/fonts/truetype", "/usr/share/fonts", "/usr/local/share/fonts"];
+            let fams = ["dejavu", "liberation", "noto"];
             let mut candidates = Vec::new();
             for n in names {
-                candidates.push(format!("/usr/share/fonts/truetype/dejavu/{n}"));
-                candidates.push(format!("/usr/share/fonts/truetype/liberation/{n}"));
-                candidates.push(format!("/usr/share/fonts/truetype/noto/{n}"));
+                for r in roots {
+                    candidates.push(format!("{r}/{n}"));
+                    for f in fams {
+                        candidates.push(format!("{r}/{f}/{n}"));
+                    }
+                }
             }
             candidates.iter().find_map(|p| std::fs::read(p).ok())
         }
