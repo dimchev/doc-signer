@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{Local, TimeZone};
-use openssl::asn1::Asn1TimeRef;
+use chrono::Local;
+use openssl::asn1::{Asn1Time, Asn1TimeRef};
 use openssl::ecdsa::EcdsaSig;
 use openssl::nid::Nid;
 use openssl::hash::MessageDigest;
@@ -69,11 +69,12 @@ impl Entry {
     }
 
     fn info(&self) -> crate::CertInfo {
+        let (not_before, not_after) = validity(&self.cert);
         crate::CertInfo {
             subject: display_name(self.cert.subject_name()),
             issuer: display_name(self.cert.issuer_name()),
-            not_before: local_time(self.cert.not_before()),
-            not_after: local_time(self.cert.not_after()),
+            not_before,
+            not_after,
             thumbprint: self.thumbprint(),
             doc_signing: has_doc_signing_eku(&self.cert),
         }
@@ -224,24 +225,26 @@ fn display_name(n: &X509NameRef) -> String {
         .join(", ")
 }
 
-/// OpenSSL prints X509 times as `Nov 22 14:25:30 2036 GMT` (UTCTime) or
-/// `2055-01-01 00:00:00Z` (GeneralizedTime).
-fn local_time(t: &Asn1TimeRef) -> chrono::DateTime<Local> {
-    let s = t.to_string();
-    let parsed = s
-        .strip_suffix('Z')
-        .and_then(|g| {
-            chrono::NaiveDateTime::parse_from_str(g, "%Y-%m-%d %H:%M:%S")
-                .ok()
-                .map(|ndt| Local.from_local_datetime(&ndt).single())
-        })
-        .or_else(|| {
-            let g = s.strip_suffix("GMT").unwrap_or(&s).trim();
-            chrono::NaiveDateTime::parse_from_str(g, "%b %d %H:%M:%S %Y")
-                .ok()
-                .map(|ndt| Local.from_local_datetime(&ndt).single())
-        });
-    parsed.flatten().unwrap_or_else(Local::now)
+/// X.509 times are always UTC (RFC 5280 §4.1.2.5). The instant is taken from OpenSSL's own
+/// `ASN1_TIME_diff` against the Unix epoch, so no string parsing and no local-time interpretation
+/// is involved. `None` if OpenSSL cannot interpret the time.
+fn local_time(t: &Asn1TimeRef) -> Option<chrono::DateTime<Local>> {
+    let epoch = Asn1Time::from_unix(0).ok()?;
+    let d = epoch.diff(t).ok()?;
+    let secs = i64::from(d.days) * 86_400 + i64::from(d.secs);
+    chrono::DateTime::from_timestamp(secs, 0).map(|utc| utc.with_timezone(&Local))
+}
+
+/// Validity period; an unreadable one is reported as expired at the epoch (fail closed), so such a
+/// certificate is never offered as valid.
+fn validity(cert: &X509) -> (chrono::DateTime<Local>, chrono::DateTime<Local>) {
+    match (local_time(cert.not_before()), local_time(cert.not_after())) {
+        (Some(nb), Some(na)) => (nb, na),
+        _ => {
+            let epoch = chrono::DateTime::UNIX_EPOCH.with_timezone(&Local);
+            (epoch, epoch)
+        }
+    }
 }
 
 fn has_doc_signing_eku(cert: &X509) -> bool {
@@ -307,6 +310,17 @@ mod tests {
     fn missing_dir_is_empty_not_error() {
         let dir = std::path::Path::new("/nonexistent-doc-signer-certs-test-xyz");
         assert!(scan_dir(dir).expect("missing dir is not an error").is_empty());
+    }
+
+    /// X.509 times are UTC: the instant must not depend on the local timezone.
+    #[test]
+    fn certificate_times_are_utc_instants() {
+        // A non-UTC zone (POSIX TZ string, no tz database needed) exposes local-time misparsing.
+        unsafe { std::env::set_var("TZ", "EET-2") };
+        let utc_time = Asn1Time::from_str("300101000000Z").unwrap(); // UTCTime
+        let gen_time = Asn1Time::from_str("20550101120000Z").unwrap(); // GeneralizedTime
+        assert_eq!(local_time(&utc_time).unwrap().timestamp(), 1_893_456_000);
+        assert_eq!(local_time(&gen_time).unwrap().timestamp(), 2_682_417_600);
     }
 }
 
