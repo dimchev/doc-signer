@@ -1,6 +1,6 @@
 # Design: signature stamp appearance (shape, style, own and imported graphics)
 
-Status: implemented (phases 1–5) · Target: v0.2.0 · Epic #27 (phases #22–#26)
+Status: implemented (phases 1-5) · Target: v0.2.0 · Epic #27 (phases #22-#26)
 
 Decisions: the stamp stays a raster image; **"Digitally signed by {name}" is mandatory** (cannot be removed); corporate palette `#1A3E8C` / `#00A19A`.
 
@@ -85,7 +85,7 @@ Non-goals:
 
 ### 2.4 Built-in styles (gallery)
 
-1. **Classic**: today's look (rectangle, blue ink, 3–5 lines).
+1. **Classic**: today's look (rectangle, blue ink, 3-5 lines).
 2. **Minimal**: no border; name and date only.
 3. **Badge**: rounded rectangle with a coloured background and white text.
 4. **Seal**: circle; top arc = name, bottom arc = date, centre = ✓ or logo.
@@ -151,7 +151,7 @@ The default style goes into `settings.txt` as `style=<id>`.
 
 | Phase | Contents | Acceptance |
 |---|---|---|
-| 1 | `tiny-skia` renderer; RGBA in the PDF; style model, JSON storage; built-in styles 1–3 and 6; gallery; editor (shape rect/rounded/ellipse/none, palette, border, font, fields, placeholders); Import/Export, `locked` | The existing "Classic" look matches today's pixel for pixel ±; CI validation stays green |
+| 1 | `tiny-skia` renderer; RGBA in the PDF; style model, JSON storage; built-in styles 1-3 and 6; gallery; editor (shape rect/rounded/ellipse/none, palette, border, font, fields, placeholders); Import/Export, `locked` | The existing "Classic" look matches today's pixel for pixel ±; CI validation stays green |
 | 2 | Images: from file (PNG/JPG/SVG/PDF), background removal, trimming, positions; drawing pad; style 5 | A scanned signature on a white background ends up transparent |
 | 3 | Round seal: text along an arc, centre image or ✓; style 4 | Text does not overlap at any length (auto-fit to the arc) |
 | 4 | From signed PDF (list of signatures, rendering the appearance alone) | Works with PDFs signed by Adobe, B-Trust and this app |

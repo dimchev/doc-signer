@@ -93,7 +93,7 @@ pub fn signed_attributes(content_digest: &[u8], cert_der: &[u8]) -> Vec<u8> {
     signed_attributes_at(content_digest, cert_der, None)
 }
 
-/// RFC 5652 Time: UTCTime for 1950–2049, GeneralizedTime otherwise.
+/// RFC 5652 Time: UTCTime for 1950-2049, GeneralizedTime otherwise.
 fn der_time(t: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
     use chrono::Datelike;
     if (1950..2050).contains(&t.year()) {

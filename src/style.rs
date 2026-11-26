@@ -179,7 +179,7 @@ pub struct StyleImage {
     pub position: ImagePosition,
     #[serde(default = "one")]
     pub opacity: f32,
-    /// Luminance threshold (0.5–0.99) above which pixels become transparent; `None` = keep.
+    /// Luminance threshold (0.5-0.99) above which pixels become transparent; `None` = keep.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove_background: Option<f32>,
 }
