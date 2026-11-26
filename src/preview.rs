@@ -34,6 +34,21 @@ impl Previewer {
         self.pdfium.is_some()
     }
 
+    /// First page as unpremultiplied RGBA, longest side `max_side` (for importing a PDF graphic).
+    pub fn render_raster(&self, path: &Path, max_side: u32) -> Result<crate::image_src::Raster> {
+        let pdfium = self.pdfium.as_ref().ok_or_else(|| anyhow!("{}", crate::i18n::t().no_pdfium))?;
+        let doc = pdfium.load_pdf_from_file(path, None)?;
+        let page = doc.pages().get(0)?;
+        let (w, h) = (page.width().value, page.height().value);
+        let cfg = if w >= h {
+            PdfRenderConfig::new().set_target_width(max_side as i32)
+        } else {
+            PdfRenderConfig::new().set_target_height(max_side as i32)
+        };
+        let img = page.render_with_config(&cfg)?.as_image()?.into_rgba8();
+        Ok(crate::image_src::Raster { width: img.width(), height: img.height(), rgba: img.into_raw() })
+    }
+
     pub fn render(&self, path: &Path, page: usize, width_px: i32) -> Result<ColorImage> {
         let pdfium = self.pdfium.as_ref().ok_or_else(|| anyhow!("{}", crate::i18n::t().no_pdfium))?;
         let doc = pdfium.load_pdf_from_file(path, None)?;

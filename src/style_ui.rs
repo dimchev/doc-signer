@@ -1,13 +1,70 @@
 //! Stamp-style UI: gallery, actions menu, style editor and the import / rename / delete dialogs.
 
 use std::collections::HashMap;
+use std::path::Path;
 
-use eframe::egui::{self, Color32, RichText, TextureHandle, TextureOptions, vec2};
+use eframe::egui::{self, Color32, Pos2, RichText, Sense, TextureHandle, TextureOptions, vec2};
 
 use crate::i18n::{self, t};
+use crate::image_src::{self, Raster};
+use crate::preview::Previewer;
 use crate::settings;
 use crate::stamp;
-use crate::style::{self, Align, BorderStyle, Field, FieldKind, FontFamily, Rgb, Shape, StampData, Style};
+use crate::style::{self, Align, BorderStyle, Field, FieldKind, FontFamily, ImagePosition, Rgb, Shape, StampData, Style, StyleImage};
+
+/// Drawing canvas size (logical points).
+const CANVAS: egui::Vec2 = egui::Vec2::new(560.0, 200.0);
+
+struct DrawPad {
+    strokes: Vec<Vec<Pos2>>,
+    width: f32,
+    color: [u8; 3],
+}
+
+impl DrawPad {
+    fn new() -> Self {
+        DrawPad { strokes: Vec::new(), width: 2.5, color: [0x10, 0x20, 0x60] }
+    }
+
+    /// Smooth (Catmull-Rom) strokes with round caps, rendered at `image_src::MAX_SIDE` width and trimmed.
+    fn rasterize(&self) -> Option<Raster> {
+        use tiny_skia::{LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+        let s = image_src::MAX_SIDE as f32 / CANVAS.x;
+        let mut pm = Pixmap::new((CANVAS.x * s) as u32, (CANVAS.y * s) as u32)?;
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(self.color[0], self.color[1], self.color[2], 255);
+        paint.anti_alias = true;
+        let stroke = Stroke { width: self.width * s, line_cap: LineCap::Round, line_join: LineJoin::Round, ..Stroke::default() };
+        for st in self.strokes.iter().filter(|st| !st.is_empty()) {
+            let p: Vec<(f32, f32)> = st.iter().map(|q| (q.x * s, q.y * s)).collect();
+            let mut pb = PathBuilder::new();
+            pb.move_to(p[0].0, p[0].1);
+            if p.len() == 1 {
+                pb.line_to(p[0].0 + 0.01, p[0].1);
+            }
+            let n = p.len();
+            for i in 0..n.saturating_sub(1) {
+                let (a, b, c, d) = (p[i.saturating_sub(1)], p[i], p[i + 1], p[(i + 2).min(n - 1)]);
+                let c1 = (b.0 + (c.0 - a.0) / 6.0, b.1 + (c.1 - a.1) / 6.0);
+                let c2 = (c.0 - (d.0 - b.0) / 6.0, c.1 - (d.1 - b.1) / 6.0);
+                pb.cubic_to(c1.0, c1.1, c2.0, c2.1, c.0, c.1);
+            }
+            if let Some(path) = pb.finish() {
+                pm.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+            }
+        }
+        let rgba = pm
+            .pixels()
+            .iter()
+            .flat_map(|p| {
+                let c = p.demultiply();
+                [c.red(), c.green(), c.blue(), c.alpha()]
+            })
+            .collect();
+        let r = image_src::trim(&Raster { width: pm.width(), height: pm.height(), rgba });
+        (r.width > 1).then_some(r)
+    }
+}
 
 pub enum Note {
     Ok(String),
@@ -41,6 +98,7 @@ pub struct StyleUi {
     import_queue: Vec<Style>,
     confirm_delete: Option<String>,
     rename: Option<Rename>,
+    pad: Option<DrawPad>,
     textures: HashMap<String, (String, TextureHandle)>,
     notes: Vec<Note>,
 }
@@ -49,7 +107,7 @@ fn fingerprint(s: &Style, data: &StampData, w: f32, h: f32, scale: f32) -> Strin
     format!(
         "{}|{}|{}|{}|{}|{}|{}|{w}|{h}|{scale}|{}",
         i18n::current().code(),
-        style::to_json(s),
+        s.fingerprint(),
         data.name,
         data.issuer,
         data.reason,
@@ -82,6 +140,7 @@ impl StyleUi {
             import_queue: Vec::new(),
             confirm_delete: None,
             rename: None,
+            pad: None,
             textures: HashMap::new(),
             notes: Vec::new(),
         };
@@ -303,9 +362,111 @@ impl StyleUi {
     }
 
     /// Dialogs and the editor window; call once per frame.
-    pub fn windows(&mut self, ctx: &egui::Context, data: &StampData) {
-        self.editor_window(ctx, data);
+    pub fn windows(&mut self, ctx: &egui::Context, data: &StampData, previewer: &Previewer) {
+        self.editor_window(ctx, data, previewer);
+        self.pad_window(ctx);
         self.dialogs(ctx);
+    }
+
+    /// Sets the editor's picture from a raster (keeps position/opacity of an existing one).
+    fn set_picture(&mut self, r: Raster) {
+        let Some(ed) = &mut self.editor else { return };
+        let opaque = r.is_opaque();
+        let r = if opaque { r } else { image_src::trim(&r) };
+        match image_src::to_png_base64(&r) {
+            Ok(b64) => {
+                let old = ed.style.image.take();
+                ed.style.image = Some(StyleImage {
+                    png_base64: b64,
+                    position: old.as_ref().map_or(ImagePosition::Left, |o| o.position),
+                    opacity: old.as_ref().map_or(1.0, |o| o.opacity),
+                    // Scans and photos have a white background; drawings and PNG/SVG logos are transparent.
+                    remove_background: opaque.then_some(0.9),
+                });
+            }
+            Err(e) => self.notes.push(Note::Err(format!("{}: {e:#}", t().style.err_image))),
+        }
+    }
+
+    fn pick_picture(&mut self, previewer: &Previewer) {
+        let ts = &t().style;
+        let Some(path) = rfd::FileDialog::new().add_filter(ts.image_filter, &["png", "jpg", "jpeg", "svg", "pdf"]).pick_file() else {
+            return;
+        };
+        let pdf = |p: &Path| previewer.render_raster(p, image_src::MAX_SIDE);
+        match image_src::load_file(&path, &pdf) {
+            Ok(r) => self.set_picture(r),
+            Err(e) => self.notes.push(Note::Err(format!("{}: {}: {e:#}", ts.err_image, path.display()))),
+        }
+    }
+
+    fn pad_window(&mut self, ctx: &egui::Context) {
+        let Some(mut pad) = self.pad.take() else { return };
+        let ts = &t().style;
+        let mut done: Option<bool> = None;
+        egui::Modal::new(egui::Id::unique("style-draw")).show(ctx, |ui| {
+            ui.heading(ts.draw_title);
+            let (resp, painter) = ui.allocate_painter(CANVAS, Sense::drag());
+            let origin = resp.rect.min;
+            painter.rect_filled(resp.rect, 4.0, Color32::WHITE);
+            // Signature line.
+            let base_y = resp.rect.bottom() - 40.0;
+            painter.line_segment([Pos2::new(resp.rect.left() + 20.0, base_y), Pos2::new(resp.rect.right() - 20.0, base_y)], (1.0, Color32::LIGHT_GRAY));
+            if resp.drag_started() {
+                pad.strokes.push(Vec::new());
+            }
+            if (resp.dragged() || resp.drag_started())
+                && let Some(pos) = resp.interact_pointer_pos()
+            {
+                let local = (pos - origin).to_pos2();
+                if let Some(st) = pad.strokes.last_mut() {
+                    if st.last().is_none_or(|l: &Pos2| l.distance(local) > 0.7) {
+                        st.push(local);
+                    }
+                }
+            }
+            let [r, g, b] = pad.color;
+            let stroke = egui::Stroke::new(pad.width, Color32::from_rgb(r, g, b));
+            for st in &pad.strokes {
+                let pts: Vec<Pos2> = st.iter().map(|p| origin + p.to_vec2()).collect();
+                if pts.len() == 1 {
+                    painter.circle_filled(pts[0], pad.width / 2.0, stroke.color);
+                } else {
+                    painter.add(egui::Shape::line(pts, stroke));
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label(ts.pen);
+                ui.add(egui::Slider::new(&mut pad.width, 1.0..=8.0));
+                ui.color_edit_button_srgb(&mut pad.color);
+                if ui.add_enabled(!pad.strokes.is_empty(), egui::Button::new(ts.undo)).clicked() {
+                    pad.strokes.pop();
+                }
+                if ui.add_enabled(!pad.strokes.is_empty(), egui::Button::new(t().clear)).clicked() {
+                    pad.strokes.clear();
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button(ts.cancel).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    done = Some(false);
+                }
+                let ok = !pad.strokes.is_empty();
+                if ui.add_enabled(ok, egui::Button::new(RichText::new(ts.use_drawing).strong())).clicked()
+                    || (ok && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                {
+                    done = Some(true);
+                }
+            });
+        });
+        match done {
+            Some(true) => {
+                if let Some(r) = pad.rasterize() {
+                    self.set_picture(r);
+                }
+            }
+            Some(false) => {}
+            None => self.pad = Some(pad),
+        }
     }
 
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -400,12 +561,13 @@ impl StyleUi {
         }
     }
 
-    fn editor_window(&mut self, ctx: &egui::Context, data: &StampData) {
+    fn editor_window(&mut self, ctx: &egui::Context, data: &StampData, previewer: &Previewer) {
         let Some(mut ed) = self.editor.take() else { return };
         let ts = &t().style;
         let mut open = true;
         let mut action: Option<bool> = None; // Some(false) = save, Some(true) = save as new
         let mut cancel = false;
+        let (mut pick, mut draw) = (false, false);
         egui::Window::new(ts.editor_title)
             .open(&mut open)
             .default_width(520.0)
@@ -598,6 +760,39 @@ impl StyleUi {
                 }
 
                 ui.separator();
+                ui.strong(ts.image);
+                ui.horizontal_wrapped(|ui| {
+                    pick = ui.button(ts.from_file).clicked();
+                    draw = ui.button(ts.draw).clicked();
+                    if s.image.is_some() && ui.button(ts.remove).clicked() {
+                        s.image = None;
+                    }
+                });
+                if let Some(img) = &mut s.image {
+                    if img.is_empty() {
+                        ui.label(RichText::new(ts.no_image).weak());
+                    } else if let Some((w, h)) = stamp::picture_size(img) {
+                        ui.label(RichText::new(ts.image_size.replace("{w}", &w.to_string()).replace("{h}", &h.to_string())).weak().small());
+                    }
+                    ui.horizontal_wrapped(|ui| {
+                        ui.radio_value(&mut img.position, ImagePosition::Left, ts.left);
+                        ui.radio_value(&mut img.position, ImagePosition::Right, ts.right);
+                        ui.radio_value(&mut img.position, ImagePosition::Top, ts.pos_top);
+                        ui.radio_value(&mut img.position, ImagePosition::Background, ts.pos_background);
+                    });
+                    ui.add(egui::Slider::new(&mut img.opacity, 0.05..=1.0).text(ts.opacity));
+                    ui.horizontal(|ui| {
+                        let mut on = img.remove_background.is_some();
+                        if ui.checkbox(&mut on, ts.remove_bg).changed() {
+                            img.remove_background = on.then_some(0.9);
+                        }
+                        if let Some(th) = &mut img.remove_background {
+                            ui.add(egui::Slider::new(th, 0.5..=0.99).fixed_decimals(2));
+                        }
+                    });
+                }
+
+                ui.separator();
                 ui.checkbox(&mut s.locked, ts.locked_opt);
                 s.normalize();
                 ui.horizontal(|ui| {
@@ -614,6 +809,15 @@ impl StyleUi {
                 });
             });
 
+        if pick || draw {
+            self.editor = Some(ed);
+            if pick {
+                self.pick_picture(previewer);
+            } else {
+                self.pad = Some(DrawPad::new());
+            }
+            return;
+        }
         match action {
             Some(as_new) => {
                 let mut s = ed.style;

@@ -133,6 +133,36 @@ impl FieldKind {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePosition {
+    Left,
+    Right,
+    Top,
+    /// Behind the text (watermark).
+    Background,
+}
+
+/// A picture in the stamp: handwritten signature, logo or company seal.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct StyleImage {
+    /// PNG, base64 (so exported styles are self-contained). Empty = no picture yet.
+    #[serde(default)]
+    pub png_base64: String,
+    pub position: ImagePosition,
+    #[serde(default = "one")]
+    pub opacity: f32,
+    /// Luminance threshold (0.5–0.99) above which pixels become transparent; `None` = keep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_background: Option<f32>,
+}
+
+impl StyleImage {
+    pub fn is_empty(&self) -> bool {
+        self.png_base64.is_empty()
+    }
+}
+
 fn yes() -> bool {
     true
 }
@@ -209,6 +239,8 @@ pub struct Style {
     pub border: Border,
     pub font: FontSpec,
     pub fields: Vec<Field>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<StyleImage>,
 }
 
 /// Values shown in a stamp.
@@ -283,6 +315,25 @@ impl Style {
         if let Some(s) = &mut self.font.size {
             *s = s.clamp(3.0, 72.0);
         }
+        if let Some(img) = &mut self.image {
+            img.opacity = img.opacity.clamp(0.05, 1.0);
+            if let Some(t) = &mut img.remove_background {
+                *t = t.clamp(0.5, 0.99);
+            }
+        }
+    }
+
+    /// Identity of everything that affects rendering, with the image data replaced by its hash
+    /// (cheap to compare every frame).
+    pub fn fingerprint(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut c = self.clone();
+        if let Some(img) = &mut c.image {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            img.png_base64.hash(&mut h);
+            img.png_base64 = format!("{}:{:x}", img.png_base64.len(), h.finish());
+        }
+        to_json(&c)
     }
 
     /// The text lines of this style for the given values; empty optional fields are skipped.
@@ -335,6 +386,7 @@ fn base(id: &str, name: &str) -> Style {
             Field::new(FieldKind::Issuer).off(),
             Field::new(FieldKind::Contact).off(),
         ],
+        image: None,
     }
 }
 
@@ -364,7 +416,17 @@ pub fn builtins() -> Vec<Style> {
     corporate.border = Border { width: 1.0, style: BorderStyle::Double };
     corporate.size = Size { w: 200.0, h: 66.0 };
 
-    let mut v = vec![classic, minimal, badge, corporate];
+    let mut handwritten = base("builtin:handwritten", tr.handwritten);
+    handwritten.shape = Shape::None;
+    handwritten.size = Size { w: 210.0, h: 60.0 };
+    handwritten.fields = vec![
+        Field::new(FieldKind::Label),
+        Field::new(FieldKind::Name).bold(1.3),
+        Field::new(FieldKind::Date).no_prefix().format("%d.%m.%Y %H:%M"),
+    ];
+    handwritten.image = Some(StyleImage { png_base64: String::new(), position: ImagePosition::Left, opacity: 1.0, remove_background: Some(0.9) });
+
+    let mut v = vec![classic, minimal, badge, corporate, handwritten];
     for s in &mut v {
         s.normalize();
     }

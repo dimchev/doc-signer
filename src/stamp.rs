@@ -4,13 +4,67 @@
 //! outlines (`ab_glyph`) into paths, so any Unicode (incl. Cyrillic) works without embedding
 //! fonts into the PDF, and glyphs can be transformed freely.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ab_glyph::{Font, FontVec, GlyphId, OutlineCurve, PxScale, ScaleFont};
-use tiny_skia::{FillRule, Paint, Path, PathBuilder, Pixmap, Rect, Stroke, StrokeDash, Transform};
+use tiny_skia::{FillRule, FilterQuality, Paint, Path, PathBuilder, Pixmap, PixmapPaint, Rect, Stroke, StrokeDash, Transform};
 
 use crate::fonts;
-use crate::style::{Align, BorderStyle, FontFamily, Line, Rgb, Shape, StampData, Style};
+use crate::image_src;
+use crate::style::{Align, BorderStyle, FontFamily, ImagePosition, Line, Rgb, Shape, StampData, Style, StyleImage};
+
+/// Gap between the picture and the text, in points.
+const IMAGE_GAP_PT: f32 = 3.0;
+
+/// The style's picture decoded, background-removed and trimmed, as a premultiplied pixmap.
+/// Cached by content and threshold, because rendering happens for every preview frame.
+fn processed(img: &StyleImage) -> Option<Arc<Pixmap>> {
+    use std::hash::{Hash, Hasher};
+    static CACHE: OnceLock<Mutex<HashMap<(u64, u32), Option<Arc<Pixmap>>>>> = OnceLock::new();
+    if img.is_empty() {
+        return None;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    img.png_base64.hash(&mut h);
+    let key = (h.finish(), img.remove_background.map_or(0, f32::to_bits));
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return hit.clone();
+    }
+    let result = image_src::from_png_base64(&img.png_base64).ok().and_then(|mut r| {
+        if let Some(t) = img.remove_background {
+            image_src::remove_background(&mut r, t);
+        }
+        let r = image_src::trim(&r);
+        let mut pm = Pixmap::new(r.width, r.height)?;
+        for (dst, src) in pm.pixels_mut().iter_mut().zip(r.rgba.chunks_exact(4)) {
+            *dst = tiny_skia::ColorU8::from_rgba(src[0], src[1], src[2], src[3]).premultiply();
+        }
+        Some(Arc::new(pm))
+    });
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > 32 {
+        map.clear();
+    }
+    map.insert(key, result.clone());
+    result
+}
+
+/// Size of the processed (background-removed, trimmed) picture.
+pub fn picture_size(img: &StyleImage) -> Option<(u32, u32)> {
+    processed(img).map(|p| (p.width(), p.height()))
+}
+
+/// Draws `pic` fitted (aspect kept) and centred into the box.
+fn draw_fitted(pm: &mut Pixmap, pic: &Pixmap, x: f32, y: f32, w: f32, h: f32, opacity: f32) {
+    let (pw, ph) = (pic.width() as f32, pic.height() as f32);
+    let s = (w / pw).min(h / ph);
+    let (dw, dh) = (pw * s, ph * s);
+    let t = Transform::from_row(s, 0.0, 0.0, s, x + (w - dw) / 2.0, y + (h - dh) / 2.0);
+    let paint = PixmapPaint { opacity: opacity.clamp(0.0, 1.0), quality: FilterQuality::Bicubic, ..PixmapPaint::default() };
+    pm.draw_pixmap(0, 0, pic.as_ref(), &paint, t, None);
+}
 
 /// Padding between the shape and the text, in points.
 const PAD_PT: f32 = 4.0;
@@ -226,7 +280,34 @@ pub fn render(style: &Style, data: &StampData, w_pt: f32, h_pt: f32, scale: f32)
     // Text.
     let lines: Vec<Line> = style.lines(data);
     let f = fonts_for(style.font.family);
-    let (x0, y0, x1, y1) = content_box(style, w, h, scale);
+    let (mut x0, mut y0, mut x1, y1) = content_box(style, w, h, scale);
+
+    // Picture: takes a part of the content box (or sits behind the text).
+    if let Some((img, pic)) = style.image.as_ref().and_then(|i| processed(i).map(|p| (i, p))) {
+        let (cw, ch) = (x1 - x0, y1 - y0);
+        let aspect = pic.width() as f32 / pic.height() as f32;
+        let gap = IMAGE_GAP_PT * scale;
+        match img.position {
+            ImagePosition::Left | ImagePosition::Right => {
+                let iw = (cw * 0.42).min(ch * aspect);
+                if img.position == ImagePosition::Left {
+                    draw_fitted(&mut pm, &pic, x0, y0, iw, ch, img.opacity);
+                    x0 += iw + gap;
+                } else {
+                    draw_fitted(&mut pm, &pic, x1 - iw, y0, iw, ch, img.opacity);
+                    x1 -= iw + gap;
+                }
+            }
+            ImagePosition::Top => {
+                let ih = (ch * 0.45).min(cw / aspect);
+                draw_fitted(&mut pm, &pic, x0, y0, cw, ih, img.opacity);
+                y0 += ih + gap;
+            }
+            ImagePosition::Background => draw_fitted(&mut pm, &pic, x0, y0, cw, ch, img.opacity),
+        }
+        x1 = x1.max(x0 + 1.0);
+        y0 = y0.min(y1 - 1.0);
+    }
     let (avail_w, avail_h) = (x1 - x0, y1 - y0);
     let units: f32 = lines.iter().map(|l| l.scale).sum::<f32>() * LEADING;
     let base = match style.font.size {
@@ -335,6 +416,26 @@ mod tests {
         assert_eq!(alpha_at(&ellipse, 2, 2), 0);
         assert_eq!(alpha_at(&ellipse, 100, 50), 255);
         assert_eq!(alpha_at(&none, 100, 2), 0);
+    }
+
+    #[test]
+    fn picture_is_drawn_and_text_moves_aside() {
+        let mut s = builtins().into_iter().find(|s| s.id == "builtin:handwritten").unwrap();
+        let red = image_src::Raster { width: 20, height: 20, rgba: [230, 0, 0, 255].repeat(400) };
+        let img = s.image.as_mut().unwrap();
+        img.png_base64 = image_src::to_png_base64(&red).unwrap();
+        img.remove_background = None;
+        let out = render(&s, &data("A"), 200.0, 60.0, 2.0);
+        let is_red = |p: &[u8]| p[0] > 200 && p[1] < 60 && p[3] > 200;
+        let w = out.width as usize;
+        let (mut left, mut right) = (0, 0);
+        for (i, p) in out.rgba.chunks_exact(4).enumerate() {
+            if is_red(p) {
+                if i % w < w / 2 { left += 1 } else { right += 1 }
+            }
+        }
+        assert!(left > 1000, "picture on the left");
+        assert_eq!(right, 0, "nothing red on the right");
     }
 
     #[test]
