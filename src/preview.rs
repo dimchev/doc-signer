@@ -60,9 +60,9 @@ impl Previewer {
         Ok(crate::image_src::Raster { width: img.width(), height: img.height(), rgba: img.into_raw() })
     }
 
-    pub fn render(&self, path: &Path, page: usize, width_px: i32) -> Result<ColorImage> {
+    pub fn render(&self, path: &Path, password: Option<&str>, page: usize, width_px: i32) -> Result<ColorImage> {
         let pdfium = self.pdfium.as_ref().ok_or_else(|| anyhow!("{}", crate::i18n::t().no_pdfium))?;
-        let doc = pdfium.load_pdf_from_file(path, None)?;
+        let doc = pdfium.load_pdf_from_file(path, password)?;
         let page = doc.pages().get(page as _)?;
         let bitmap = page.render_with_config(&PdfRenderConfig::new().set_target_width(width_px))?;
         let img = bitmap.as_image()?.into_rgba8();

@@ -58,11 +58,26 @@ jobs:
       - name: Validate the signed PDF independently
         run: python scripts/validate_signature.py ci-test/test.pdf.signed.pdf ci-test/certs/ci.crt
 
+      # Encrypted PDFs (#37): RC4-40/128, AES-128/256, user and owner passwords, restricted permissions.
+      - name: E2E encrypted PDFs validated with pyhanko
+        run: |
+          set -euo pipefail
+          sign() {
+            cp "tests/fixtures/encrypted/$1" "ci-test/$1"
+            DOC_SIGNER_TEST_PDF="$GITHUB_WORKSPACE/ci-test/$1" DOC_SIGNER_PDF_PASSWORD="$2" cargo test signs_with -- --include-ignored --nocapture
+            python scripts/validate_signature.py "ci-test/$1.signed.pdf" ci-test/certs/ci.crt --password "$2"
+          }
+          sign rc4-40-owner.pdf ""
+          sign rc4-128-user.pdf user
+          sign aes-128-owner.pdf ""
+          sign aes-256-user.pdf user
+          sign aes-256-no-signing.pdf owner
+
       # Any file as CAdES .p7s / .p7m, verified by OpenSSL (#35).
       - name: E2E .p7s / .p7m verified with OpenSSL
         run: |
           set -euo pipefail
-          printf 'Doc Signer CI – arbitrary file\n' > ci-test/file.txt
+          printf 'Doc Signer CI - arbitrary file\n' > ci-test/file.txt
           DOC_SIGNER_TEST_PDF="$GITHUB_WORKSPACE/ci-test/file.txt" cargo test signs_file -- --include-ignored --nocapture
           openssl cms -verify -binary -inform DER -in ci-test/file.txt.p7s -content ci-test/file.txt -CAfile ci-test/certs/ci.crt -purpose any -out /dev/null
           openssl cms -verify -binary -inform DER -in ci-test/file.txt.p7m -CAfile ci-test/certs/ci.crt -purpose any -out ci-test/recovered.txt

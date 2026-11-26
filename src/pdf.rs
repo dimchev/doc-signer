@@ -6,7 +6,7 @@ use std::io::Write;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local};
-use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
+use lopdf::{Dictionary, Document, LoadOptions, Object, ObjectId, Permissions, Stream};
 use sha2::{Digest, Sha256};
 
 use crate::cms::{self, SignerCert};
@@ -66,6 +66,8 @@ impl PageGeom {
 pub struct PdfInfo {
     pub pages: Vec<PageGeom>,
     pub signatures: usize,
+    /// Encrypted (opened with an empty or the given password).
+    pub encrypted: bool,
 }
 
 fn inherited<'a>(doc: &'a Document, mut id: ObjectId, key: &[u8]) -> Option<&'a Object> {
@@ -112,12 +114,67 @@ fn sig_fields(doc: &Document) -> impl Iterator<Item = &Dictionary> {
     doc.objects.values().filter_map(|o| o.as_dict().ok()).filter(|d| is_sig_field(d))
 }
 
-fn load(bytes: &[u8]) -> Result<Document> {
-    let doc = Document::load_mem(bytes).map_err(|e| anyhow!("{}: {e}", t().err_invalid_pdf))?;
+/// Why an encrypted PDF cannot be opened or signed; the UI answers it with a password prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Locked {
+    /// A user (open) password is set and none or an empty one was given.
+    NeedsPassword,
+    WrongPassword,
+    /// Opened, but the permissions forbid signing; the owner password lifts that.
+    SigningNotAllowed,
+}
+
+impl std::fmt::Display for Locked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Locked::NeedsPassword => t().err_pdf_password,
+            Locked::WrongPassword => t().err_wrong_password,
+            Locked::SigningNotAllowed => t().err_no_sign_permission,
+        })
+    }
+}
+
+impl std::error::Error for Locked {}
+
+/// Loads (and, for encrypted files, decrypts) a PDF. Owner-password-only files open without a password.
+fn load(bytes: &[u8], password: Option<&str>) -> Result<Document> {
+    let options = password.map(LoadOptions::with_password).unwrap_or_default();
+    let doc = match Document::load_mem_with_options(bytes, options) {
+        Ok(doc) => doc,
+        Err(lopdf::Error::InvalidPassword) => return Err(Locked::WrongPassword.into()),
+        Err(e) => bail!("{}: {e}", t().err_invalid_pdf),
+    };
+    // lopdf leaves /Encrypt in the trailer only when it could not decrypt.
     if doc.trailer.get(b"Encrypt").is_ok() {
-        bail!(t().err_encrypted);
+        return Err(Locked::NeedsPassword.into());
     }
     Ok(doc)
+}
+
+/// Signing adds a signature field: allowed with "annotate / fill in forms" (R3+: "fill in forms"
+/// alone is enough, as in Adobe's "Signing: Allowed"), or always with the owner password.
+fn check_can_sign(doc: &Document, password: Option<&str>) -> Result<()> {
+    let Some(state) = &doc.encryption_state else { return Ok(()) };
+    let p = state.permissions();
+    if p.contains(Permissions::ANNOTABLE) || (state.revision() >= 3 && p.contains(Permissions::FILLABLE)) {
+        return Ok(());
+    }
+    if let (Some(pw), Ok(enc)) = (password, state.encode()) {
+        // A document holding only /Encrypt and /ID is enough for lopdf's password checks.
+        let mut probe = Document::with_version("1.7");
+        let enc_id = probe.add_object(enc);
+        probe.trailer.set("Encrypt", Object::Reference(enc_id));
+        if let Ok(id) = doc.trailer.get(b"ID") {
+            probe.trailer.set("ID", id.clone());
+        }
+        if probe.authenticate_owner_password(pw).is_ok() {
+            return Ok(());
+        }
+        if probe.authenticate_user_password(pw).is_err() {
+            return Err(Locked::WrongPassword.into());
+        }
+    }
+    Err(Locked::SigningNotAllowed.into())
 }
 
 /// Visible appearance of an existing signature, as a standalone one-page PDF.
@@ -218,7 +275,7 @@ fn standalone_appearance(src: &Document, ap: ObjectId, bbox: [f32; 4]) -> Result
 /// Visible appearances of all signatures in the document (widgets with `/FT /Sig`, directly or
 /// through their parent field, that have a normal appearance stream).
 pub fn signature_appearances(bytes: &[u8]) -> Result<Vec<Appearance>> {
-    let doc = load(bytes)?;
+    let doc = load(bytes, None)?;
     let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
     let mut out = Vec::new();
     for obj in doc.objects.values() {
@@ -246,14 +303,15 @@ pub fn signature_appearances(bytes: &[u8]) -> Result<Vec<Appearance>> {
     Ok(out)
 }
 
-pub fn inspect(bytes: &[u8]) -> Result<PdfInfo> {
-    let doc = load(bytes)?;
+pub fn inspect(bytes: &[u8], password: Option<&str>) -> Result<PdfInfo> {
+    let doc = load(bytes, password)?;
+    check_can_sign(&doc, password)?;
     let pages: Vec<PageGeom> = page_geoms(&doc).into_iter().map(|(_, g)| g).collect();
     if pages.is_empty() {
         bail!(t().err_no_pages);
     }
     let signatures = sig_fields(&doc).filter(|d| d.get(b"V").is_ok()).count();
-    Ok(PdfInfo { pages, signatures })
+    Ok(PdfInfo { pages, signatures, encrypted: doc.encryption_state.is_some() })
 }
 
 pub struct Visible {
@@ -271,6 +329,8 @@ pub struct SignRequest {
     pub contact: String,
     pub time: DateTime<Local>,
     pub visible: Option<Visible>,
+    /// Password of an encrypted PDF (user or owner); `None` if it opens without one.
+    pub password: Option<String>,
 }
 
 // ---------- serialization ----------
@@ -350,6 +410,19 @@ fn text(s: &str) -> Object {
     Object::String(b, lopdf::StringFormat::Hexadecimal)
 }
 
+fn stream(dict: Dictionary, data: &[u8], compress: bool) -> Object {
+    let mut d = dict;
+    let content = if compress {
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+        e.write_all(data).unwrap();
+        d.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+        e.finish().unwrap()
+    } else {
+        data.to_vec()
+    };
+    Object::Stream(Stream::new(d, content))
+}
+
 fn stream_obj(dict: Dictionary, data: &[u8], compress: bool) -> Vec<u8> {
     let mut d = dict;
     let content = if compress {
@@ -394,7 +467,17 @@ fn resolve_array(doc: &Document, o: Option<&Object>) -> Vec<Object> {
 pub type Timestamper<'a> = &'a dyn Fn(&[u8]) -> Result<Vec<u8>>;
 
 pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn Fn(&[u8]) -> Result<Vec<u8>>, timestamp: Option<Timestamper>) -> Result<Vec<u8>> {
-    let doc = load(input)?;
+    let doc = load(input, req.password.as_deref())?;
+    check_can_sign(&doc, req.password.as_deref())?;
+    // New and rewritten objects of an encrypted file are encrypted with their own object key
+    // (ISO 32000-2, 7.6.2); the signature's /Contents and the xref stream stay plain.
+    let crypt = doc.encryption_state.as_ref();
+    let seal = |id: ObjectId, mut o: Object| -> Result<Vec<u8>> {
+        if let Some(state) = crypt {
+            lopdf::encryption::encrypt_object(state, id, &mut o).map_err(|e| anyhow!("{}: {e}", t().err_pdf_structure))?;
+        }
+        Ok(obj_bytes(&o))
+    };
     let prev_xref = startxref(input)?;
     let prev_is_stream = !input[prev_xref..].iter().skip_while(|c| c.is_ascii_whitespace()).take(4).eq(b"xref".iter());
 
@@ -456,7 +539,7 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
             sm.set("Height", img.height as i64);
             sm.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
             sm.set("BitsPerComponent", 8i64);
-            objects.push((smask_id, stream_obj(sm, &alpha, true)));
+            objects.push((smask_id, seal(smask_id, stream(sm, &alpha, true))?));
 
             let mut im = Dictionary::new();
             im.set("Type", Object::Name(b"XObject".to_vec()));
@@ -466,7 +549,7 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
             im.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
             im.set("BitsPerComponent", 8i64);
             im.set("SMask", Object::Reference(smask_id));
-            objects.push((image_id, stream_obj(im, &rgb, true)));
+            objects.push((image_id, seal(image_id, stream(im, &rgb, true))?));
 
             let content = format!("q {w_pt} 0 0 {h_pt} 0 0 cm /Im1 Do Q\n");
             let mut form = Dictionary::new();
@@ -479,7 +562,7 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
             let mut res = Dictionary::new();
             res.set("XObject", xobjs);
             form.set("Resources", res);
-            objects.push((form_id, stream_obj(form, content.as_bytes(), false)));
+            objects.push((form_id, seal(form_id, stream(form, content.as_bytes(), false))?));
 
             let mut ap = Dictionary::new();
             ap.set("N", Object::Reference(form_id));
@@ -487,14 +570,14 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
         }
         None => widget.set("Rect", Object::Array(vec![0.into(), 0.into(), 0.into(), 0.into()])),
     }
-    objects.push((widget_id, obj_bytes(&Object::Dictionary(widget))));
+    objects.push((widget_id, seal(widget_id, Object::Dictionary(widget))?));
 
     // Page: append the widget to /Annots.
     let mut page = doc.get_dictionary(page_id).map_err(|_| anyhow!("{}: /Page", t().err_pdf_structure))?.clone();
     let mut annots = resolve_array(&doc, page.get(b"Annots").ok());
     annots.push(Object::Reference(widget_id));
     page.set("Annots", annots);
-    objects.push((page_id, obj_bytes(&Object::Dictionary(page))));
+    objects.push((page_id, seal(page_id, Object::Dictionary(page))?));
 
     // AcroForm: add the field and mark the document as signed.
     let update_form = |form: &mut Dictionary| {
@@ -508,7 +591,7 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
             let form_id = *form_id;
             let mut form = doc.get_dictionary(form_id).map_err(|_| anyhow!("{}: /AcroForm", t().err_pdf_structure))?.clone();
             update_form(&mut form);
-            objects.push((form_id, obj_bytes(&Object::Dictionary(form))));
+            objects.push((form_id, seal(form_id, Object::Dictionary(form))?));
         }
         other => {
             let mut form = match other {
@@ -517,7 +600,7 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
             };
             update_form(&mut form);
             catalog.set("AcroForm", form);
-            objects.push((root_id, obj_bytes(&Object::Dictionary(catalog))));
+            objects.push((root_id, seal(root_id, Object::Dictionary(catalog))?));
         }
     }
 
@@ -527,19 +610,23 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     let contents_len = (signer.chain.iter().map(|c| c.len()).sum::<usize>() + 6000 + ts_room) * 2;
     let mut sig = Vec::new();
     sig.extend_from_slice(b"<</Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached");
-    let mut put = |key: &str, val: &str| {
-        if !val.trim().is_empty() {
-            write!(sig, " /{key} ").unwrap();
-            write_obj(&mut sig, &text(val.trim()));
-        }
-    };
-    put("Name", &req.signer_name);
-    put("Reason", &req.reason);
-    put("Location", &req.location);
-    put("ContactInfo", &req.contact);
     let m = req.time.format("D:%Y%m%d%H%M%S%:z").to_string();
     let m = format!("{}'{}'", &m[..m.len() - 3], &m[m.len() - 2..]);
-    write!(sig, " /M ({m}) /ByteRange ").unwrap();
+    let strings = [
+        ("Name", text(req.signer_name.trim())),
+        ("Reason", text(req.reason.trim())),
+        ("Location", text(req.location.trim())),
+        ("ContactInfo", text(req.contact.trim())),
+        ("M", Object::String(m.into_bytes(), lopdf::StringFormat::Literal)),
+    ];
+    for (key, val) in strings {
+        if matches!(&val, Object::String(s, _) if s.len() <= 2 && key != "M") {
+            continue;
+        }
+        write!(sig, " /{key} ").unwrap();
+        sig.extend(seal(sig_id, val)?);
+    }
+    sig.extend_from_slice(b" /ByteRange ");
     let br_off = sig.len();
     sig.extend_from_slice(b"[0 0000000000 0000000000 0000000000]");
     let br_len = sig.len() - br_off;
@@ -550,6 +637,20 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     sig.push(b'>');
     sig.extend_from_slice(b">>");
     objects.push((sig_id, sig));
+
+    // The existing /Encrypt dictionary is reused; a direct one (rare) becomes an indirect object.
+    let encrypt_ref = match crypt {
+        Some(state) => Some(match state.encrypt_object_id() {
+            Some(id) => id,
+            None => {
+                let id = alloc();
+                let dict = state.encode().map_err(|e| anyhow!("{}: /Encrypt: {e}", t().err_pdf_structure))?;
+                objects.push((id, obj_bytes(&Object::Dictionary(dict))));
+                id
+            }
+        }),
+        None => None,
+    };
 
     // Assemble the incremental update.
     let mut out = input.to_vec();
@@ -576,6 +677,9 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
         }
     }
     trailer.set("Prev", prev_xref as i64);
+    if let Some(id) = encrypt_ref {
+        trailer.set("Encrypt", Object::Reference(id));
+    }
 
     let xref_off;
     if prev_is_stream {
@@ -689,6 +793,7 @@ mod tests {
             contact: String::new(),
             time: Local::now(),
             visible: Some(Visible { page: 0, rect: [100.0, 100.0, 190.0, 62.0], image }),
+            password: None,
         };
         // The CMS is not valid here, which does not matter for the appearance.
         let signed = sign_pdf(bytes, &req, &signer, &|_| Ok(vec![0u8; 256]), None).unwrap();
@@ -698,6 +803,71 @@ mod tests {
         assert!((found[0].size.0 - 190.0).abs() < 0.5);
         check_standalone(&found[0]);
         assert!(signature_appearances(bytes).unwrap().is_empty());
+    }
+
+    fn fixture(name: &str) -> Vec<u8> {
+        std::fs::read(format!("{}/tests/fixtures/encrypted/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    fn locked(r: Result<PdfInfo>) -> Option<Locked> {
+        r.err().and_then(|e| e.downcast_ref::<Locked>().copied())
+    }
+
+    #[test]
+    fn encrypted_pdfs_open_with_the_right_password_only() {
+        for name in ["rc4-40-owner.pdf", "aes-128-owner.pdf"] {
+            assert!(inspect(&fixture(name), None).unwrap().encrypted, "{name}: owner password only, opens as is");
+        }
+        for name in ["rc4-128-user.pdf", "aes-256-user.pdf"] {
+            let bytes = fixture(name);
+            assert_eq!(locked(inspect(&bytes, None)), Some(Locked::NeedsPassword), "{name}");
+            assert_eq!(locked(inspect(&bytes, Some("nope"))), Some(Locked::WrongPassword), "{name}");
+            assert!(inspect(&bytes, Some("user")).unwrap().encrypted, "{name}");
+            assert!(inspect(&bytes, Some("owner")).unwrap().encrypted, "{name}");
+        }
+        let restricted = fixture("aes-256-no-signing.pdf");
+        assert_eq!(locked(inspect(&restricted, None)), Some(Locked::SigningNotAllowed));
+        assert_eq!(locked(inspect(&restricted, Some("wrong"))), Some(Locked::WrongPassword));
+        assert!(inspect(&restricted, Some("owner")).is_ok(), "the owner password lifts the restriction");
+        assert!(!inspect(include_bytes!("../tests/fixtures/minimal.pdf"), None).unwrap().encrypted);
+    }
+
+    #[test]
+    fn signs_encrypted_pdfs_with_encrypted_new_objects() {
+        let signer = SignerCert { der: vec![0x30, 0], issuer_der: vec![0x30, 0], serial_be: vec![1], chain: vec![vec![0x30, 0]], alg: cms::KeyAlg::Rsa };
+        let data = crate::style::StampData { name: "Тест Signer".into(), issuer: String::new(), reason: "Одобрено".into(), location: String::new(), contact: String::new(), time: Local::now() };
+        let cases = [("rc4-40-owner.pdf", None), ("rc4-128-user.pdf", Some("user")), ("aes-128-owner.pdf", None), ("aes-256-user.pdf", Some("user")), ("aes-256-no-signing.pdf", Some("owner"))];
+        for (name, password) in cases {
+            let input = fixture(name);
+            let req = SignRequest {
+                signer_name: "Тест Signer".into(),
+                reason: "Одобрено".into(),
+                location: String::new(),
+                contact: String::new(),
+                time: Local::now(),
+                visible: Some(Visible { page: 0, rect: [100.0, 100.0, 190.0, 62.0], image: stamp::render(&crate::style::builtins().remove(0), &data, 190.0, 62.0, 2.0) }),
+                password: password.map(str::to_string),
+            };
+            let signed = sign_pdf(&input, &req, &signer, &|_| Ok(vec![0u8; 256]), None).unwrap();
+            let tail = &signed[input.len()..];
+            assert!(!tail.windows(9).any(|w| w == b"Signature"), "{name}: field name is encrypted");
+            assert!(tail.windows(14).any(|w| w == b"/Contents <308"), "{name}: /Contents stays plain");
+            assert!(tail.windows(9).any(|w| w == b"/Encrypt "), "{name}: trailer keeps /Encrypt");
+
+            let doc = load(&signed, password).unwrap();
+            let sig = doc.objects.values().filter_map(|o| o.as_dict().ok()).find(|d| d.get(b"ByteRange").is_ok()).expect("signature dictionary");
+            assert_eq!(pdf_text(sig.get(b"Name").unwrap().as_str().unwrap()), "Тест Signer", "{name}");
+            assert_eq!(pdf_text(sig.get(b"Reason").unwrap().as_str().unwrap()), "Одобрено", "{name}");
+            assert!(sig.get(b"M").unwrap().as_str().unwrap().starts_with(b"D:20"), "{name}");
+            let field = sig_fields(&doc).find(|d| d.get(b"V").is_ok()).unwrap();
+            assert_eq!(pdf_text(field.get(b"T").unwrap().as_str().unwrap()), "Signature1", "{name}");
+            let rgb = doc.objects.values().filter_map(|o| o.as_stream().ok()).find(|s| s.dict.get(b"SMask").is_ok()).expect("stamp image");
+            let (w, h) = (rgb.dict.get(b"Width").unwrap().as_i64().unwrap(), rgb.dict.get(b"Height").unwrap().as_i64().unwrap());
+            assert_eq!(rgb.decompressed_content().unwrap().len() as i64, w * h * 3, "{name}: stamp image decrypts and inflates");
+            assert_eq!(inspect(&signed, password).unwrap().signatures, 1, "{name}");
+        }
+        let err = sign_pdf(&fixture("aes-256-no-signing.pdf"), &SignRequest { signer_name: "x".into(), reason: String::new(), location: String::new(), contact: String::new(), time: Local::now(), visible: None, password: None }, &signer, &|_| Ok(vec![0u8; 256]), None);
+        assert_eq!(locked(err.map(|_| PdfInfo { pages: vec![], signatures: 0, encrypted: true })), Some(Locked::SigningNotAllowed));
     }
 
     #[test]
@@ -726,7 +896,9 @@ mod tests {
         let thumb: Vec<u8> = (0..thumb_hex.len()).step_by(2).map(|i| u8::from_str_radix(&thumb_hex[i..i + 2], 16).unwrap()).collect();
         let signer = crate::certs::load_signer(&thumb).unwrap();
         let bytes = std::fs::read(&input).unwrap();
-        let info = inspect(&bytes).unwrap();
+        // Optional DOC_SIGNER_PDF_PASSWORD for encrypted input.
+        let password = std::env::var("DOC_SIGNER_PDF_PASSWORD").ok();
+        let info = inspect(&bytes, password.as_deref()).unwrap();
         let env_or = |k: &str, d: String| std::env::var(k).unwrap_or(d);
         let (page, rect) = match std::env::var("DOC_SIGNER_RECT").ok() {
             Some(s) => {
@@ -757,13 +929,13 @@ mod tests {
             time,
         };
         let image = stamp::render(&style, &data, rect[2], rect[3], 4.0);
-        let req = SignRequest { signer_name, reason, location, contact, time, visible: Some(Visible { page, rect, image }) };
+        let req = SignRequest { signer_name, reason, location, contact, time, visible: Some(Visible { page, rect, image }), password: password.clone() };
         // Optional DOC_SIGNER_TSA=<url>: add an RFC 3161 time-stamp (PAdES B-T).
         let tsa = std::env::var("DOC_SIGNER_TSA").ok();
         let ts = |v: &[u8]| crate::tsa::timestamp(tsa.as_deref().unwrap(), v).map(|t| t.token);
         let ts_ref: Option<Timestamper> = if tsa.is_some() { Some(&ts) } else { None };
         let out = sign_pdf(&bytes, &req, &signer, &|d| crate::certs::sign_data(&thumb, d, signer.alg), ts_ref).unwrap();
         std::fs::write(format!("{input}.signed.pdf"), &out).unwrap();
-        assert_eq!(inspect(&out).unwrap().signatures, info.signatures + 1);
+        assert_eq!(inspect(&out, password.as_deref()).unwrap().signatures, info.signatures + 1);
     }
 }

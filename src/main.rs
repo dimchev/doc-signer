@@ -71,6 +71,10 @@ struct Doc {
     pdf: bool,
     /// File size in bytes (shown for non-PDF files).
     bytes: u64,
+    /// Password of an encrypted PDF, in memory only.
+    password: Option<String>,
+    /// Why an encrypted PDF cannot be used yet (offers the password prompt).
+    locked: Option<pdf::Locked>,
 }
 
 impl Doc {
@@ -126,6 +130,8 @@ struct App {
     previewer: preview::Previewer,
     page_tex: Option<(PathBuf, usize, Result<TextureHandle, String>)>,
     job: Option<Receiver<JobMsg>>,
+    /// Open password prompt: document index, typed password, last error.
+    password_prompt: Option<(usize, String, Option<String>)>,
 }
 
 impl App {
@@ -154,6 +160,7 @@ impl App {
             previewer: preview::Previewer::new(),
             page_tex: None,
             job: None,
+            password_prompt: None,
         };
         if !app.previewer.available() {
             app.push(Level::Info, t().pdfium_missing);
@@ -229,19 +236,20 @@ impl App {
             return;
         }
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let info = if is_pdf {
-            std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| pdf::inspect(&b).map_err(|e| format!("{e:#}")))
+        let (info, locked) = if is_pdf {
+            inspect_pdf(&path, None)
         } else {
             // Any other file is signed as a whole (CAdES); one placeholder page keeps the PDF-only code paths safe.
-            std::fs::File::open(&path)
-                .map(|_| PdfInfo { pages: vec![pdf::PageGeom { crop: [0.0, 0.0, 595.0, 842.0], rotate: 0 }], signatures: 0 })
-                .map_err(|e| e.to_string())
+            let info = std::fs::File::open(&path)
+                .map(|_| PdfInfo { pages: vec![pdf::PageGeom { crop: [0.0, 0.0, 595.0, 842.0], rotate: 0 }], signatures: 0, encrypted: false })
+                .map_err(|e| e.to_string());
+            (info, None)
         };
         if let Err(e) = &info {
             self.push(Level::Err, format!("{}: {e}", path.display()));
         }
         let checked = info.is_ok();
-        self.docs.push(Doc { path, info, checked, status: Status::Ready, placement: None, size: None, style: None, pdf: is_pdf, bytes });
+        self.docs.push(Doc { path, info, checked, status: Status::Ready, placement: None, size: None, style: None, pdf: is_pdf, bytes, password: None, locked });
         if self.selected.is_none() {
             self.select(self.docs.len() - 1);
         }
@@ -327,7 +335,7 @@ impl App {
             Vec::new()
         };
         let container_dst = container.first().map(|(_, p)| self.cades_output_path(p));
-        let tasks: Vec<(usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>, style::Style, bool)> = self
+        let tasks: Vec<(usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>, style::Style, bool, Option<String>)> = self
             .docs
             .iter()
             .enumerate()
@@ -340,7 +348,7 @@ impl App {
                     None
                 };
                 let dst = if d.pdf { self.output_path(&d.path) } else { self.cades_output_path(&d.path) };
-                (i, d.path.clone(), dst, visible, self.doc_style(d).clone(), d.pdf)
+                (i, d.path.clone(), dst, visible, self.doc_style(d).clone(), d.pdf, d.password.clone())
             })
             .collect();
         if tasks.is_empty() && container.is_empty() {
@@ -359,7 +367,7 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let signer = certs::load_signer(&cert.thumbprint);
-            for (idx, src, dst, visible, stamp_style, is_pdf) in tasks {
+            for (idx, src, dst, visible, stamp_style, is_pdf, password) in tasks {
                 let result = (|| -> anyhow::Result<PathBuf> {
                     let signer = signer.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
                     let input = std::fs::read(&src)?;
@@ -392,6 +400,7 @@ impl App {
                         contact: contact.clone(),
                         time,
                         visible,
+                        password,
                     };
                     let out = pdf::sign_pdf(&input, &req, signer, &sign, ts_ref)?;
                     std::fs::write(&tmp, &out)?;
@@ -439,7 +448,7 @@ impl App {
                     last_ok = Some(p.clone());
                     if let Some(doc) = self.docs.get_mut(i) {
                         if doc.path == p {
-                            if let Ok(info) = std::fs::read(&p).map_err(anyhow::Error::from).and_then(|b| pdf::inspect(&b)) {
+                            if let Ok(info) = std::fs::read(&p).map_err(anyhow::Error::from).and_then(|b| pdf::inspect(&b, doc.password.as_deref())) {
                                 doc.info = Ok(info);
                             }
                         }
@@ -505,6 +514,7 @@ impl App {
 
         let mut remove = None;
         let mut select = None;
+        let mut unlock = None;
         let busy = self.job.is_some();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, doc) in self.docs.iter_mut().enumerate() {
@@ -563,6 +573,9 @@ impl App {
                         }
                         (Ok(info), _) => {
                             let mut s = t().pages.replace("{n}", &info.pages.len().to_string());
+                            if info.encrypted {
+                                s += &format!(" · {}", t().encrypted_note);
+                            }
                             if info.signatures > 0 {
                                 s += &format!(" · {}", t().already_signed.replace("{n}", &info.signatures.to_string()));
                             }
@@ -577,6 +590,9 @@ impl App {
                     };
                     if ui.add(egui::Label::new(detail).sense(Sense::click())).clicked() {
                         select = Some(i);
+                    }
+                    if doc.locked.is_some() && ui.add_enabled(!busy, egui::Button::new(t().enter_password).small()).clicked() {
+                        unlock = Some(i);
                     }
                     if let Status::Signed(p) = &doc.status {
                         ui.horizontal(|ui| {
@@ -597,6 +613,9 @@ impl App {
         if let Some(i) = select {
             self.select(i);
         }
+        if let Some(i) = unlock {
+            self.password_prompt = Some((i, String::new(), None));
+        }
         if let Some(i) = remove {
             self.docs.remove(i);
             self.page_tex = None;
@@ -608,6 +627,67 @@ impl App {
             if let Some(s) = self.selected {
                 self.select(s);
             }
+        }
+    }
+
+    fn password_window(&mut self, ctx: &egui::Context) {
+        let Some((idx, password, error)) = &mut self.password_prompt else { return };
+        let Some(doc) = self.docs.get(*idx) else {
+            self.password_prompt = None;
+            return;
+        };
+        let mut decision = None;
+        egui::Modal::new(egui::Id::unique("pdf-password")).show(ctx, |ui| {
+            ui.heading(t().password_title.replace("{name}", &doc.name()));
+            if let Some(locked) = doc.locked {
+                ui.label(locked.to_string());
+            }
+            let edit = ui.add(egui::TextEdit::singleline(password).password(true).desired_width(320.0));
+            edit.request_focus();
+            if let Some(e) = error {
+                ui.colored_label(Color32::from_rgb(210, 60, 60), e.as_str());
+            }
+            ui.label(RichText::new(t().password_hint).weak().small());
+            ui.horizontal(|ui| {
+                let ok = !password.is_empty();
+                if ui.add_enabled(ok, egui::Button::new(t().unlock)).clicked() || (ok && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                    decision = Some(true);
+                }
+                if ui.button(t().style.cancel).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                    decision = Some(false);
+                }
+            });
+        });
+        match decision {
+            Some(true) => {
+                let (idx, password) = (*idx, password.clone());
+                let (info, locked) = inspect_pdf(&self.docs[idx].path, Some(&password));
+                match info {
+                    Ok(info) => {
+                        let doc = &mut self.docs[idx];
+                        doc.info = Ok(info);
+                        doc.locked = None;
+                        doc.password = Some(password);
+                        doc.checked = true;
+                        doc.status = Status::Ready;
+                        self.password_prompt = None;
+                        self.page_tex = None;
+                        self.select(idx);
+                    }
+                    Err(e) => {
+                        // Still locked: keep the prompt open with the reason; other errors replace the card's.
+                        if locked.is_none() {
+                            self.docs[idx].info = Err(e.clone());
+                        }
+                        if let Some((_, pw, err)) = &mut self.password_prompt {
+                            pw.clear();
+                            *err = Some(e);
+                        }
+                    }
+                }
+            }
+            Some(false) => self.password_prompt = None,
+            None => {}
         }
     }
 
@@ -823,7 +903,7 @@ impl App {
         if stale && self.previewer.available() {
             let tex = self
                 .previewer
-                .render(&path, self.page, 1400)
+                .render(&path, self.docs[sel].password.as_deref(), self.page, 1400)
                 .map(|img| ctx.load_texture("page", img, TextureOptions::LINEAR))
                 .map_err(|e| format!("{e:#}"));
             self.page_tex = Some((path.clone(), self.page, tex));
@@ -983,6 +1063,17 @@ impl App {
     }
 }
 
+/// Reads and inspects a PDF; an encrypted one that still needs a (different) password reports why.
+fn inspect_pdf(path: &Path, password: Option<&str>) -> (Result<PdfInfo, String>, Option<pdf::Locked>) {
+    match std::fs::read(path).map_err(anyhow::Error::from).and_then(|b| pdf::inspect(&b, password)) {
+        Ok(info) => (Ok(info), None),
+        Err(e) => {
+            let locked = e.downcast_ref::<pdf::Locked>().copied();
+            (Err(format!("{e:#}")), locked)
+        }
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = &ui.ctx().clone();
@@ -1012,6 +1103,7 @@ impl eframe::App for App {
         egui::Panel::right("settings").resizable(true).default_size(360.0).size_range(320.0..=520.0).show(ui, |ui| self.settings_panel(ui, ctx));
         egui::CentralPanel::default().show(ui, |ui| self.preview_panel(ui, ctx));
 
+        self.password_window(ctx);
         let data = self.stamp_data();
         self.styles.windows(ctx, &data, &self.previewer);
         for note in self.styles.take_notes() {
