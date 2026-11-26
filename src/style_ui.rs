@@ -462,7 +462,7 @@ impl StyleUi {
                             let s = (max.x / a.size.0).min(max.y / a.size.1);
                             ui.add(egui::Image::from_texture(tex).fit_to_exact_size(vec2(a.size.0 * s, a.size.1 * s)).bg_fill(Color32::WHITE));
                             ui.vertical(|ui| {
-                                let who = if a.signer.is_empty() { "—" } else { a.signer.as_str() };
+                                let who = if a.signer.is_empty() { "-" } else { a.signer.as_str() };
                                 ui.label(ts.signer_page.replace("{signer}", who).replace("{page}", &(a.page + 1).to_string()));
                                 if ui.button(RichText::new(ts.use_drawing).strong()).clicked() {
                                     chosen = Some(i);

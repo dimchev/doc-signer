@@ -58,6 +58,20 @@ jobs:
       - name: Validate the signed PDF independently
         run: python scripts/validate_signature.py ci-test/test.pdf.signed.pdf ci-test/certs/ci.crt
 
+      # Any file as CAdES .p7s / .p7m, verified by OpenSSL (#35).
+      - name: E2E .p7s / .p7m verified with OpenSSL
+        run: |
+          set -euo pipefail
+          printf 'Doc Signer CI – arbitrary file\n' > ci-test/file.txt
+          DOC_SIGNER_TEST_PDF="$GITHUB_WORKSPACE/ci-test/file.txt" cargo test signs_file -- --include-ignored --nocapture
+          openssl cms -verify -binary -inform DER -in ci-test/file.txt.p7s -content ci-test/file.txt -CAfile ci-test/certs/ci.crt -purpose any -out /dev/null
+          openssl cms -verify -binary -inform DER -in ci-test/file.txt.p7m -CAfile ci-test/certs/ci.crt -purpose any -out ci-test/recovered.txt
+          cmp ci-test/file.txt ci-test/recovered.txt
+          echo tampered >> ci-test/file.txt
+          if openssl cms -verify -binary -inform DER -in ci-test/file.txt.p7s -content ci-test/file.txt -CAfile ci-test/certs/ci.crt -purpose any -out /dev/null; then
+            echo "tampered file verified - this must fail"; exit 1
+          fi
+
       # PAdES B-T with a real public TSA (#34).
       - name: E2E with an RFC 3161 time-stamp
         env:
