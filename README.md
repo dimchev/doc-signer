@@ -7,7 +7,7 @@ A small desktop application (Rust + egui) for digitally signing PDF documents �
 Prebuilt binaries (built from `master` by GitHub Actions) are on the [Releases page](https://github.com/dimchev/doc-signer/releases):
 
 - **Windows x64** — `doc-signer-windows-x64.zip`: unzip and run `doc-signer.exe` (`pdfium.dll` is included for the page preview).
-- **Linux x64** — `doc-signer-linux-x64.tar.gz`: extract and run `./doc-signer`. Needs the GTK3 and X11 system libraries (e.g. `sudo apt install libgtk-3-0 libx11-6`); `libpdfium.so` is included for the page preview.
+- **Linux x64** — `doc-signer-linux-x64.tar.gz`: extract and run `./doc-signer` (`libpdfium.so` is included for the page preview). Built on Ubuntu 22.04, so it needs **glibc ≥ 2.35**, **OpenSSL 3** (`libssl3`), **GTK 3** and **X11** — e.g. Ubuntu 22.04+, Debian 12+, Fedora 36+, current Arch (`sudo apt install libgtk-3-0 libx11-6 libssl3`). On older distributions, build from source.
 
 ## Features
 
@@ -35,6 +35,12 @@ Supported file formats:
 
 - **PKCS#12** (`.p12`, `.pfx`) — certificate + key (+ optional chain) in one file. The passphrase is taken from the `DOC_SIGNER_PASS` environment variable, or from a `.pass` file next to the PKCS#12 file (first line).
 - **X.509 + private key** — a `.crt`, `.cer`, `.der` or `.pem` certificate plus the matching private key in a file next to it (e.g. `signer.crt` + `signer.key`, or `signer.pem` + `signer.key.pem`).
+
+Passphrases:
+
+- `DOC_SIGNER_PASS` applies to **every** key and PKCS#12 file in the folder.
+- A `.pass` file (e.g. `signer.p12.pass`, `signer.key.pass`) stores the passphrase in plain text. It must be readable only by you (`chmod 600 signer.p12.pass`); like ssh, the app ignores it when group or others can read it.
+- Files that cannot be parsed are skipped; the certificate list is re-read with the ⟳ button.
 
 ## Building
 

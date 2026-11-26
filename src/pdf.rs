@@ -566,7 +566,7 @@ mod tests {
             time: chrono::Local::now(),
             visible: Some(Visible { page, rect }),
         };
-        let out = sign_pdf(&bytes, &req, &signer, &|d| crate::certs::sign_digest(&thumb, d, signer.alg)).unwrap();
+        let out = sign_pdf(&bytes, &req, &signer, &|d| crate::certs::sign_data(&thumb, d, signer.alg)).unwrap();
         std::fs::write(format!("{input}.signed.pdf"), &out).unwrap();
         assert_eq!(inspect(&out).unwrap().signatures, info.signatures + 1);
     }
