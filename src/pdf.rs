@@ -541,9 +541,10 @@ mod tests {
     #[test]
     #[ignore]
     fn signs_with_real_certificate() {
-        // Skipped unless both variables are set.
-        let Some(input) = std::env::var("DOC_SIGNER_TEST_PDF").ok() else { return };
-        let Some(thumb_hex) = std::env::var("DOC_SIGNER_THUMB").ok() else { return };
+        let (Ok(input), Ok(thumb_hex)) = (std::env::var("DOC_SIGNER_TEST_PDF"), std::env::var("DOC_SIGNER_THUMB")) else {
+            eprintln!("SKIPPED signs_with_real_certificate: set DOC_SIGNER_TEST_PDF and DOC_SIGNER_THUMB to run it");
+            return;
+        };
         let thumb: Vec<u8> = (0..thumb_hex.len()).step_by(2).map(|i| u8::from_str_radix(&thumb_hex[i..i + 2], 16).unwrap()).collect();
         let signer = crate::certs::load_signer(&thumb).unwrap();
         let bytes = std::fs::read(&input).unwrap();
