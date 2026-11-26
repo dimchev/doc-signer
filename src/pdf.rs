@@ -1,12 +1,12 @@
 //! PDF inspection and PAdES signing via an incremental update (existing content and
 //! earlier signatures are never rewritten).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Local};
-use lopdf::{Dictionary, Document, Object, ObjectId};
+use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 use sha2::{Digest, Sha256};
 
 use crate::cms::{self, SignerCert};
@@ -118,6 +118,132 @@ fn load(bytes: &[u8]) -> Result<Document> {
         bail!(t().err_encrypted);
     }
     Ok(doc)
+}
+
+/// Visible appearance of an existing signature, as a standalone one-page PDF.
+pub struct Appearance {
+    pub page: usize,
+    pub signer: String,
+    /// Width and height in points.
+    pub size: (f32, f32),
+    /// One page of exactly `size`, containing only the appearance (no page content underneath).
+    pub pdf: Vec<u8>,
+}
+
+/// PDF text string: UTF-16BE with BOM, otherwise PDFDocEncoding (≈ Latin-1).
+fn pdf_text(b: &[u8]) -> String {
+    if let Some(rest) = b.strip_prefix(&[0xFE, 0xFF]) {
+        let units: Vec<u16> = rest.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        b.iter().map(|&c| c as char).collect()
+    }
+}
+
+fn copy_dict(src: &Document, dst: &mut Document, d: Dictionary, map: &mut HashMap<ObjectId, ObjectId>) -> Result<Dictionary> {
+    let mut out = Dictionary::new();
+    for (k, v) in d.into_iter() {
+        // Back-links to the page / field tree would drag the whole document along.
+        if k == b"Parent" || k == b"P" {
+            continue;
+        }
+        out.set(k, copy_obj(src, dst, v, map)?);
+    }
+    Ok(out)
+}
+
+fn copy_obj(src: &Document, dst: &mut Document, obj: Object, map: &mut HashMap<ObjectId, ObjectId>) -> Result<Object> {
+    Ok(match obj {
+        Object::Reference(r) => Object::Reference(copy_ref(src, dst, r, map)?),
+        Object::Array(a) => Object::Array(a.into_iter().map(|o| copy_obj(src, dst, o, map)).collect::<Result<_>>()?),
+        Object::Dictionary(d) => Object::Dictionary(copy_dict(src, dst, d, map)?),
+        Object::Stream(mut s) => {
+            s.dict = copy_dict(src, dst, s.dict, map)?;
+            Object::Stream(s)
+        }
+        o => o,
+    })
+}
+
+fn copy_ref(src: &Document, dst: &mut Document, id: ObjectId, map: &mut HashMap<ObjectId, ObjectId>) -> Result<ObjectId> {
+    if let Some(n) = map.get(&id) {
+        return Ok(*n);
+    }
+    let new = dst.new_object_id();
+    map.insert(id, new);
+    let obj = src.get_object(id).map(Object::clone).unwrap_or(Object::Null);
+    let copied = copy_obj(src, dst, obj, map)?;
+    dst.objects.insert(new, copied);
+    Ok(new)
+}
+
+/// One-page PDF of `bbox`'s size that draws only the appearance form `ap` (upright, its /Matrix reset).
+fn standalone_appearance(src: &Document, ap: ObjectId, bbox: [f32; 4]) -> Result<Vec<u8>> {
+    let mut dst = Document::with_version("1.7");
+    let mut map = HashMap::new();
+    let form = copy_ref(src, &mut dst, ap, &mut map)?;
+    if let Ok(Object::Stream(s)) = dst.get_object_mut(form) {
+        s.dict.set("Matrix", Object::Array([1, 0, 0, 1, 0, 0].into_iter().map(Object::Integer).collect()));
+    }
+    let (w, h) = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+    let content = format!("q 1 0 0 1 {} {} cm /Ap Do Q", -bbox[0], -bbox[1]);
+    let content_id = dst.add_object(Stream::new(Dictionary::new(), content.into_bytes()));
+    let pages_id = dst.new_object_id();
+    let mut xobjects = Dictionary::new();
+    xobjects.set("Ap", Object::Reference(form));
+    let mut resources = Dictionary::new();
+    resources.set("XObject", xobjects);
+    let mut page = Dictionary::new();
+    page.set("Type", Object::Name(b"Page".to_vec()));
+    page.set("Parent", Object::Reference(pages_id));
+    page.set("MediaBox", Object::Array(vec![0.into(), 0.into(), Object::Real(w), Object::Real(h)]));
+    page.set("Contents", Object::Reference(content_id));
+    page.set("Resources", resources);
+    let page_id = dst.add_object(page);
+    let mut pages = Dictionary::new();
+    pages.set("Type", Object::Name(b"Pages".to_vec()));
+    pages.set("Kids", Object::Array(vec![Object::Reference(page_id)]));
+    pages.set("Count", 1i64);
+    dst.objects.insert(pages_id, Object::Dictionary(pages));
+    let mut catalog = Dictionary::new();
+    catalog.set("Type", Object::Name(b"Catalog".to_vec()));
+    catalog.set("Pages", Object::Reference(pages_id));
+    let catalog_id = dst.add_object(catalog);
+    dst.trailer.set("Root", Object::Reference(catalog_id));
+    let mut out = Vec::new();
+    dst.save_to(&mut out)?;
+    Ok(out)
+}
+
+/// Visible appearances of all signatures in the document (widgets with `/FT /Sig`, directly or
+/// through their parent field, that have a normal appearance stream).
+pub fn signature_appearances(bytes: &[u8]) -> Result<Vec<Appearance>> {
+    let doc = load(bytes)?;
+    let pages: Vec<ObjectId> = doc.get_pages().values().copied().collect();
+    let mut out = Vec::new();
+    for obj in doc.objects.values() {
+        let Ok(widget) = obj.as_dict() else { continue };
+        if !matches!(widget.get(b"Subtype").and_then(|o| o.as_name()), Ok(n) if n == b"Widget") {
+            continue;
+        }
+        let parent = widget.get(b"Parent").ok().and_then(|p| p.as_reference().ok()).and_then(|p| doc.get_dictionary(p).ok());
+        let field = if is_sig_field(widget) { widget } else if let Some(p) = parent.filter(|p| is_sig_field(p)) { p } else { continue };
+        let ap = widget.get(b"AP").ok().and_then(|ap| doc.dereference(ap).ok()).and_then(|(_, ap)| ap.as_dict().ok());
+        let Some(ap_id) = ap.and_then(|ap| ap.get(b"N").ok()).and_then(|n| n.as_reference().ok()) else { continue };
+        let Ok(stream) = doc.get_object(ap_id).and_then(|o| o.as_stream()) else { continue };
+        let Some(bbox) = stream.dict.get(b"BBox").ok().and_then(|b| rect_of(&doc, b)) else { continue };
+        let size = (bbox[2] - bbox[0], bbox[3] - bbox[1]);
+        if size.0 < 1.0 || size.1 < 1.0 {
+            continue;
+        }
+        let page = widget.get(b"P").ok().and_then(|p| p.as_reference().ok()).and_then(|p| pages.iter().position(|&x| x == p)).unwrap_or(0);
+        let sig = field.get(b"V").ok().and_then(|v| doc.dereference(v).ok()).and_then(|(_, v)| v.as_dict().ok());
+        let name = sig.and_then(|s| s.get(b"Name").ok()).or_else(|| field.get(b"T").ok());
+        let signer = name.and_then(|n| n.as_str().ok()).map(pdf_text).unwrap_or_default();
+        out.push(Appearance { page, signer, size, pdf: standalone_appearance(&doc, ap_id, bbox)? });
+    }
+    out.sort_by_key(|a| a.page);
+    Ok(out)
 }
 
 pub fn inspect(bytes: &[u8]) -> Result<PdfInfo> {
@@ -511,6 +637,59 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn check_standalone(a: &Appearance) {
+        let doc = Document::load_mem(&a.pdf).expect("standalone PDF loads");
+        let pages = doc.get_pages();
+        assert_eq!(pages.len(), 1);
+        let page = doc.get_dictionary(*pages.values().next().unwrap()).unwrap();
+        let mb = rect_of(&doc, page.get(b"MediaBox").unwrap()).unwrap();
+        assert!((mb[2] - a.size.0).abs() < 0.5 && (mb[3] - a.size.1).abs() < 0.5);
+    }
+
+    #[test]
+    fn finds_the_appearance_of_a_third_party_signature() {
+        let bytes = include_bytes!("../tests/fixtures/signed-by-pyhanko.pdf");
+        let found = signature_appearances(bytes).unwrap();
+        assert_eq!(found.len(), 1);
+        let a = &found[0];
+        assert_eq!(a.page, 0);
+        assert!(a.signer.contains("Fixture Signer"), "{}", a.signer);
+        assert!((a.size.0 - 220.0).abs() < 1.0 && (a.size.1 - 70.0).abs() < 1.0, "{:?}", a.size);
+        check_standalone(a);
+    }
+
+    #[test]
+    fn finds_the_appearance_written_by_this_app() {
+        let bytes = include_bytes!("../tests/fixtures/minimal.pdf");
+        let signer = SignerCert { der: vec![0x30, 0], issuer_der: vec![0x30, 0], serial_be: vec![1], chain: vec![vec![0x30, 0]], alg: cms::KeyAlg::Rsa };
+        let data = crate::style::StampData {
+            name: "Test Signer".into(),
+            issuer: String::new(),
+            reason: String::new(),
+            location: String::new(),
+            contact: String::new(),
+            time: Local::now(),
+        };
+        let style = crate::style::builtins().remove(0);
+        let image = stamp::render(&style, &data, 190.0, 62.0, 2.0);
+        let req = SignRequest {
+            signer_name: "Test Signer".into(),
+            reason: String::new(),
+            location: String::new(),
+            contact: String::new(),
+            time: Local::now(),
+            visible: Some(Visible { page: 0, rect: [100.0, 100.0, 190.0, 62.0], image }),
+        };
+        // The CMS is not valid here, which does not matter for the appearance.
+        let signed = sign_pdf(bytes, &req, &signer, &|_| Ok(vec![0u8; 256])).unwrap();
+        let found = signature_appearances(&signed).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].signer, "Test Signer");
+        assert!((found[0].size.0 - 190.0).abs() < 0.5);
+        check_standalone(&found[0]);
+        assert!(signature_appearances(bytes).unwrap().is_empty());
+    }
 
     #[test]
     fn rotation_maps_display_rect_to_user_space() {

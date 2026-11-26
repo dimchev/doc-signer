@@ -99,6 +99,8 @@ pub struct StyleUi {
     confirm_delete: Option<String>,
     rename: Option<Rename>,
     pad: Option<DrawPad>,
+    /// Signature appearances found in a PDF, with thumbnails, waiting for a choice.
+    sig_pick: Option<Vec<(crate::pdf::Appearance, TextureHandle)>>,
     textures: HashMap<String, (String, TextureHandle)>,
     notes: Vec<Note>,
 }
@@ -141,6 +143,7 @@ impl StyleUi {
             confirm_delete: None,
             rename: None,
             pad: None,
+            sig_pick: None,
             textures: HashMap::new(),
             notes: Vec::new(),
         };
@@ -365,6 +368,7 @@ impl StyleUi {
     pub fn windows(&mut self, ctx: &egui::Context, data: &StampData, previewer: &Previewer) {
         self.editor_window(ctx, data, previewer);
         self.pad_window(ctx);
+        self.sig_pick_window(ctx, previewer);
         self.dialogs(ctx);
     }
 
@@ -397,6 +401,73 @@ impl StyleUi {
         match image_src::load_file(&path, &pdf) {
             Ok(r) => self.set_picture(r),
             Err(e) => self.notes.push(Note::Err(format!("{}: {}: {e:#}", ts.err_image, path.display()))),
+        }
+    }
+
+    /// Reads the signature appearances of a chosen PDF and opens the chooser.
+    fn open_sig_pick(&mut self, ctx: &egui::Context, previewer: &Previewer) {
+        let ts = &t().style;
+        let Some(path) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() else { return };
+        let found = std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| crate::pdf::signature_appearances(&b));
+        match found {
+            Ok(list) if list.is_empty() => self.notes.push(Note::Err(format!("{}: {}", ts.no_appearances, path.display()))),
+            Ok(list) => {
+                let mut items = Vec::new();
+                for (i, a) in list.into_iter().enumerate() {
+                    match previewer.render_bytes_raster(&a.pdf, 480) {
+                        Ok(r) => {
+                            let img = egui::ColorImage::from_rgba_unmultiplied([r.width as usize, r.height as usize], &r.rgba);
+                            items.push((a, ctx.load_texture(format!("sig-pick-{i}"), img, TextureOptions::LINEAR)));
+                        }
+                        Err(e) => self.notes.push(Note::Err(format!("{}: {e:#}", ts.err_image))),
+                    }
+                }
+                if !items.is_empty() {
+                    self.sig_pick = Some(items);
+                }
+            }
+            Err(e) => self.notes.push(Note::Err(format!("{}: {}: {e:#}", ts.err_image, path.display()))),
+        }
+    }
+
+    fn sig_pick_window(&mut self, ctx: &egui::Context, previewer: &Previewer) {
+        let Some(items) = self.sig_pick.take() else { return };
+        let ts = &t().style;
+        let mut chosen: Option<usize> = None;
+        let mut cancel = false;
+        egui::Modal::new(egui::Id::unique("style-sig-pick")).show(ctx, |ui| {
+            ui.heading(ts.pick_title);
+            ui.colored_label(Color32::from_rgb(220, 140, 0), format!("⚠ {}", ts.pick_warning));
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                for (i, (a, tex)) in items.iter().enumerate() {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let max = vec2(300.0, 100.0);
+                            let s = (max.x / a.size.0).min(max.y / a.size.1);
+                            ui.add(egui::Image::from_texture(tex).fit_to_exact_size(vec2(a.size.0 * s, a.size.1 * s)).bg_fill(Color32::WHITE));
+                            ui.vertical(|ui| {
+                                let who = if a.signer.is_empty() { "—" } else { a.signer.as_str() };
+                                ui.label(ts.signer_page.replace("{signer}", who).replace("{page}", &(a.page + 1).to_string()));
+                                if ui.button(RichText::new(ts.use_drawing).strong()).clicked() {
+                                    chosen = Some(i);
+                                }
+                            });
+                        });
+                    });
+                }
+            });
+            if ui.button(ts.cancel).clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                cancel = true;
+            }
+        });
+        if let Some(i) = chosen {
+            match previewer.render_bytes_raster(&items[i].0.pdf, image_src::MAX_SIDE) {
+                Ok(r) => self.set_picture(r),
+                Err(e) => self.notes.push(Note::Err(format!("{}: {e:#}", ts.err_image))),
+            }
+        } else if !cancel {
+            self.sig_pick = Some(items);
         }
     }
 
@@ -567,7 +638,7 @@ impl StyleUi {
         let mut open = true;
         let mut action: Option<bool> = None; // Some(false) = save, Some(true) = save as new
         let mut cancel = false;
-        let (mut pick, mut draw) = (false, false);
+        let (mut pick, mut draw, mut from_pdf) = (false, false, false);
         egui::Window::new(ts.editor_title)
             .open(&mut open)
             .default_width(520.0)
@@ -791,6 +862,10 @@ impl StyleUi {
                 ui.horizontal_wrapped(|ui| {
                     pick = ui.button(ts.from_file).clicked();
                     draw = ui.button(ts.draw).clicked();
+                    from_pdf = ui
+                        .add_enabled(previewer.available(), egui::Button::new(ts.from_pdf))
+                        .on_disabled_hover_text(t().no_pdfium)
+                        .clicked();
                     if s.image.is_some() && ui.button(ts.remove).clicked() {
                         s.image = None;
                     }
@@ -836,12 +911,14 @@ impl StyleUi {
                 });
             });
 
-        if pick || draw {
+        if pick || draw || from_pdf {
             self.editor = Some(ed);
             if pick {
                 self.pick_picture(previewer);
-            } else {
+            } else if draw {
                 self.pad = Some(DrawPad::new());
+            } else {
+                self.open_sig_pick(ctx, previewer);
             }
             return;
         }
