@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 
+use crate::fonts;
 use crate::i18n::t;
 
 pub const INK: [u8; 3] = [0x1a, 0x3e, 0x8c];
@@ -12,53 +13,35 @@ pub const INK: [u8; 3] = [0x1a, 0x3e, 0x8c];
 struct Fonts {
     regular: FontVec,
     bold: FontVec,
+    builtin: bool,
 }
 
-fn load(names: &[&str]) -> Option<FontVec> {
-    let bytes = {
-        #[cfg(windows)]
-        {
-            let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-            names.iter().find_map(|n| std::fs::read(format!("{dir}\\Fonts\\{n}")).ok())
-        }
-        #[cfg(not(windows))]
-        {
-            // Debian/Ubuntu keep fonts under truetype/, Arch (and friends) directly under /usr/share/fonts.
-            let roots = ["/usr/share/fonts/truetype", "/usr/share/fonts", "/usr/local/share/fonts"];
-            let fams = ["dejavu", "liberation", "noto"];
-            let mut candidates = Vec::new();
-            for n in names {
-                for r in roots {
-                    candidates.push(format!("{r}/{n}"));
-                    for f in fams {
-                        candidates.push(format!("{r}/{f}/{n}"));
-                    }
-                }
-            }
-            candidates.iter().find_map(|p| std::fs::read(p).ok())
-        }
-    }?;
-    FontVec::try_from_vec(bytes).ok()
+fn parse(bytes: Option<Vec<u8>>) -> Option<FontVec> {
+    bytes.and_then(|b| FontVec::try_from_vec(b).ok())
 }
 
-fn fonts() -> Option<&'static Fonts> {
-    static F: OnceLock<Option<Fonts>> = OnceLock::new();
+/// System fonts when available, otherwise the font bundled with egui, so the stamp always has text.
+fn fonts() -> &'static Fonts {
+    static F: OnceLock<Fonts> = OnceLock::new();
     F.get_or_init(|| {
-        #[cfg(windows)]
-        {
-            let regular = load(&["arial.ttf", "segoeui.ttf", "tahoma.ttf"])?;
-            let bold = load(&["arialbd.ttf", "segoeuib.ttf"]).unwrap_or_else(|| load(&["arial.ttf", "segoeui.ttf"]).unwrap());
-            Some(Fonts { regular, bold })
-        }
-        #[cfg(not(windows))]
-        {
-            let regular = load(&["DejaVuSans.ttf", "NotoSans-Regular.ttf", "LiberationSans-Regular.ttf"])?;
-            let bold = load(&["DejaVuSans-Bold.ttf", "NotoSans-Bold.ttf", "LiberationSans-Bold.ttf"])
-                .unwrap_or_else(|| load(&["DejaVuSans.ttf", "NotoSans-Regular.ttf", "LiberationSans-Regular.ttf"]).unwrap());
-            Some(Fonts { regular, bold })
+        let (regular_names, bold_names) = fonts::STAMP;
+        let regular_bytes = fonts::find(regular_names);
+        match parse(regular_bytes.clone()) {
+            Some(regular) => {
+                let bold = parse(fonts::find(bold_names)).or_else(|| parse(regular_bytes)).expect("parsed above");
+                Fonts { regular, bold, builtin: false }
+            }
+            None => {
+                let font = || parse(Some(fonts::builtin())).expect("bundled font parses");
+                Fonts { regular: font(), bold: font(), builtin: true }
+            }
         }
     })
-    .as_ref()
+}
+
+/// True when no suitable system font was found and the bundled fallback is used.
+pub fn uses_builtin_font() -> bool {
+    fonts().builtin
 }
 
 pub struct Line {
@@ -107,9 +90,7 @@ pub fn render(lines: &[Line], w_pt: f32, h_pt: f32, scale: f32) -> Mask {
     let width = (w_pt * scale).round().max(1.0) as u32;
     let height = (h_pt * scale).round().max(1.0) as u32;
     let mut alpha = vec![0u8; (width * height) as usize];
-    let Some(f) = fonts() else {
-        return Mask { width, height, alpha };
-    };
+    let f = fonts();
 
     let pad = 4.0 * scale;
     let avail_w = width as f32 - 2.0 * pad;
