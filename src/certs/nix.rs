@@ -1,4 +1,7 @@
+use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Local;
@@ -13,10 +16,6 @@ use openssl::x509::{X509, X509NameRef};
 
 use crate::cms::{KeyAlg, SignerCert};
 use crate::i18n::t;
-
-/// Content bytes of the Microsoft Document Signing EKU OID (1.3.6.1.4.1.311.10.3.12) as they
-/// appear in the certificate DER.
-const DOC_SIGNING_OID: [u8; 10] = [0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x03, 0x0C];
 
 const FILE_EXTS: [&str; 6] = ["p12", "pfx", "pem", "crt", "cer", "der"];
 
@@ -34,7 +33,8 @@ pub fn certs_dir() -> PathBuf {
 }
 
 /// Key passphrase: DOC_SIGNER_PASS env var, or the first line of a `.pass` file
-/// next to the key / PKCS#12 file, or empty.
+/// next to the key / PKCS#12 file, or empty. Like ssh, a `.pass` file that group or
+/// others can read is ignored.
 fn passphrase_for(path: &Path) -> String {
     if let Ok(p) = std::env::var("DOC_SIGNER_PASS") {
         if !p.is_empty() {
@@ -44,10 +44,20 @@ fn passphrase_for(path: &Path) -> String {
     let mut pf = path.to_path_buf();
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let _ = pf.set_file_name(format!("{name}.pass"));
+    if let Ok(meta) = std::fs::metadata(&pf) {
+        if !is_private_mode(meta.permissions().mode()) {
+            eprintln!("doc-signer: ignoring {} - it is readable by group/others (run: chmod 600)", pf.display());
+            return String::new();
+        }
+    }
     std::fs::read_to_string(&pf)
         .ok()
         .and_then(|s| s.lines().next().map(str::to_string))
         .unwrap_or_default()
+}
+
+fn is_private_mode(mode: u32) -> bool {
+    mode & 0o077 == 0
 }
 
 fn is_cert_file(path: &Path) -> bool {
@@ -76,7 +86,7 @@ impl Entry {
             not_before,
             not_after,
             thumbprint: self.thumbprint(),
-            doc_signing: has_doc_signing_eku(&self.cert),
+            doc_signing: self.cert.to_der().is_ok_and(|der| super::has_doc_signing_eku(&der)),
         }
     }
 
@@ -131,7 +141,7 @@ fn parse_file(path: &Path) -> Result<Entry> {
         let pass = passphrase_for(path);
         let p12 = Pkcs12::from_der(&bytes).with_context(|| path.display().to_string())?;
         let parsed = p12.parse2(&pass).with_context(|| path.display().to_string())?;
-        let cert = parsed.cert.ok_or_else(|| anyhow!("{}", t().err_invalid_pdf))?;
+        let cert = parsed.cert.ok_or_else(|| anyhow!("{}: {}", t().err_invalid_cert, path.display()))?;
         Ok(Entry {
             cert,
             chain: parsed.ca.into_iter().flatten().collect(),
@@ -144,7 +154,7 @@ fn parse_file(path: &Path) -> Result<Entry> {
             X509::stack_from_pem(&bytes).with_context(|| path.display().to_string())?
         };
         let Some(cert) = certs.first().cloned() else {
-            bail!("{}", t().err_invalid_pdf);
+            bail!("{}: {}", t().err_invalid_cert, path.display());
         };
         let key = key_for(path)?;
         Ok(Entry { cert, chain: certs.into_iter().skip(1).collect(), key })
@@ -247,12 +257,17 @@ fn validity(cert: &X509) -> (chrono::DateTime<Local>, chrono::DateTime<Local>) {
     }
 }
 
-fn has_doc_signing_eku(cert: &X509) -> bool {
-    cert.to_der().unwrap_or_default().windows(DOC_SIGNING_OID.len()).any(|w| w == DOC_SIGNING_OID)
+/// Parsed (and decrypted) entries by thumbprint, so batch signing does not re-read and
+/// re-decrypt every file in the folder for each document. Cleared by `list_certificates`
+/// (the UI's refresh), which picks up changed files.
+fn cache() -> std::sync::MutexGuard<'static, HashMap<Vec<u8>, Arc<Entry>>> {
+    static CACHE: OnceLock<Mutex<HashMap<Vec<u8>, Arc<Entry>>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// All certificate files in the folder that have a private key.
 pub fn list_certificates() -> Result<Vec<crate::CertInfo>> {
+    cache().clear();
     let entries = iter_entries()?;
     let mut out = Vec::new();
     for (_, entry) in &entries {
@@ -267,7 +282,10 @@ pub fn list_certificates() -> Result<Vec<crate::CertInfo>> {
     Ok(out)
 }
 
-fn find(thumbprint: &[u8]) -> Result<Entry> {
+fn find(thumbprint: &[u8]) -> Result<Arc<Entry>> {
+    if let Some(e) = cache().get(thumbprint) {
+        return Ok(e.clone());
+    }
     let mut last_err: Option<(PathBuf, anyhow::Error)> = None;
     let dir = certs_dir();
     let rd = match std::fs::read_dir(&dir) {
@@ -281,7 +299,11 @@ fn find(thumbprint: &[u8]) -> Result<Entry> {
             continue;
         }
         match parse_file(&path) {
-            Ok(entry) if entry.thumbprint() == thumbprint => return Ok(entry),
+            Ok(entry) if entry.thumbprint() == thumbprint => {
+                let entry = Arc::new(entry);
+                cache().insert(thumbprint.to_vec(), entry.clone());
+                return Ok(entry);
+            }
             Ok(_) => {}
             Err(err) => last_err = Some((path, err)),
         }
@@ -298,13 +320,22 @@ pub fn load_signer(thumbprint: &[u8]) -> Result<SignerCert> {
 }
 
 /// Signs the SHA-256 of `data` with the certificate's private key.
-pub fn sign_digest(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>> {
+pub fn sign_data(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>> {
     find(thumbprint)?.sign(data, alg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pass_files_must_not_be_group_or_world_readable() {
+        assert!(is_private_mode(0o100600));
+        assert!(is_private_mode(0o100400));
+        assert!(!is_private_mode(0o100640));
+        assert!(!is_private_mode(0o100644));
+        assert!(!is_private_mode(0o100604));
+    }
 
     #[test]
     fn missing_dir_is_empty_not_error() {

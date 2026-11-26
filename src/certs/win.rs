@@ -81,8 +81,6 @@ unsafe fn has_private_key(ctx: *const CERT_CONTEXT) -> bool {
 
 /// Personal certificates (CurrentUser\My) that have a private key.
 pub fn list_certificates() -> Result<Vec<crate::CertInfo>> {
-    // DER of OID 1.3.6.1.4.1.311.10.3.12 (Microsoft Document Signing EKU).
-    const DOC_SIGNING_EKU: [u8; 12] = [0x06, 0x0A, 0x2B, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x0A, 0x03, 0x0C];
     let store = Store::open_my()?;
     let mut out = Vec::new();
     let mut ctx: *mut CERT_CONTEXT = null_mut();
@@ -108,7 +106,7 @@ pub fn list_certificates() -> Result<Vec<crate::CertInfo>> {
                 not_before: filetime_to_local(&info.NotBefore),
                 not_after: filetime_to_local(&info.NotAfter),
                 thumbprint: thumb,
-                doc_signing: der.windows(DOC_SIGNING_EKU.len()).any(|w| w == DOC_SIGNING_EKU),
+                doc_signing: super::has_doc_signing_eku(&der),
             });
         }
     }
@@ -155,7 +153,7 @@ pub fn load_signer(thumbprint: &[u8]) -> Result<SignerCert> {
 }
 
 /// Signs the SHA-256 of `data` with the certificate's private key (may show a PIN prompt for smart cards).
-pub fn sign_digest(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>> {
+pub fn sign_data(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>> {
     let digest = sha2::Sha256::digest(data);
     let store = Store::open_my()?;
     let cert = store.find(thumbprint)?;

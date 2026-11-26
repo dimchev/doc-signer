@@ -291,7 +291,7 @@ impl App {
                         time: Local::now(),
                         visible,
                     };
-                    let out = pdf::sign_pdf(&input, &req, signer, &|d| certs::sign_digest(&cert.thumbprint, d, signer.alg))?;
+                    let out = pdf::sign_pdf(&input, &req, signer, &|d| certs::sign_data(&cert.thumbprint, d, signer.alg))?;
                     let tmp = dst.with_extension("pdf.tmp");
                     std::fs::write(&tmp, &out)?;
                     std::fs::rename(&tmp, &dst)?;
