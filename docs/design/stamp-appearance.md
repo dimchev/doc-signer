@@ -1,6 +1,6 @@
 # Design: signature stamp appearance (shape, style, own and imported graphics)
 
-Status: accepted · Target: v0.2.0 · Epic #27 (phases #22–#26)
+Status: implemented (phases 1–5) · Target: v0.2.0 · Epic #27 (phases #22–#26)
 
 Decisions: the stamp stays a raster image; **"Digitally signed by {name}" is mandatory** (cannot be removed); corporate palette `#1A3E8C` / `#00A19A`.
 
