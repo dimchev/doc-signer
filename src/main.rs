@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod asic;
 mod cades;
 mod certs;
 mod i18n;
@@ -319,11 +320,18 @@ impl App {
     fn start_signing(&mut self, ctx: &egui::Context) {
         let Some(cert) = self.current_cert().cloned() else { return };
         let cades_format = self.cades_format;
+        let asice = cades_format == cades::Format::Asice;
+        let container: Vec<(usize, PathBuf)> = if asice {
+            self.docs.iter().enumerate().filter(|(_, d)| d.checked && d.info.is_ok() && !d.pdf).map(|(i, d)| (i, d.path.clone())).collect()
+        } else {
+            Vec::new()
+        };
+        let container_dst = container.first().map(|(_, p)| self.cades_output_path(p));
         let tasks: Vec<(usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>, style::Style, bool)> = self
             .docs
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.checked && d.info.is_ok())
+            .filter(|(_, d)| d.checked && d.info.is_ok() && (d.pdf || !asice))
             .map(|(i, d)| {
                 let visible = if self.visible && d.pdf {
                     let size = self.doc_size(d);
@@ -335,13 +343,14 @@ impl App {
                 (i, d.path.clone(), dst, visible, self.doc_style(d).clone(), d.pdf)
             })
             .collect();
-        if tasks.is_empty() {
+        if tasks.is_empty() && container.is_empty() {
             return;
         }
-        for (i, ..) in &tasks {
-            self.docs[*i].status = Status::Queued;
+        for i in tasks.iter().map(|t| t.0).chain(container.iter().map(|c| c.0)) {
+            self.docs[i].status = Status::Queued;
         }
-        self.push(Level::Info, t().signing_log.replace("{n}", &tasks.len().to_string()).replace("{cert}", &cert.subject));
+        let n = tasks.len() + container.len();
+        self.push(Level::Info, t().signing_log.replace("{n}", &n.to_string()).replace("{cert}", &cert.subject));
 
         let (tx, rx) = channel();
         self.job = Some(rx);
@@ -390,6 +399,28 @@ impl App {
                     Ok(dst)
                 })();
                 let _ = tx.send(JobMsg::Done(idx, result.map_err(|e| format!("{e:#}"))));
+                ctx.request_repaint();
+            }
+            if let Some(dst) = container_dst {
+                let result = (|| -> anyhow::Result<PathBuf> {
+                    let signer = signer.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
+                    let paths: Vec<&Path> = container.iter().map(|(_, p)| p.as_path()).collect();
+                    let mut files = Vec::new();
+                    for (name, path) in asic::entry_names(&paths).into_iter().zip(&paths) {
+                        files.push((name, std::fs::read(path)?));
+                    }
+                    let ts = |v: &[u8]| tsa::timestamp(tsa_url.as_deref().unwrap_or(tsa::DEFAULT_URL), v).map(|t| t.token);
+                    let ts_ref: Option<pdf::Timestamper> = if tsa_url.is_some() { Some(&ts) } else { None };
+                    let out = asic::build(&files, signer, &|d| certs::sign_data(&cert.thumbprint, d, signer.alg), ts_ref)?;
+                    let tmp = PathBuf::from(format!("{}.tmp", dst.display()));
+                    std::fs::write(&tmp, &out)?;
+                    std::fs::rename(&tmp, &dst)?;
+                    Ok(dst)
+                })();
+                let result = result.map_err(|e| format!("{e:#}"));
+                for (idx, _) in &container {
+                    let _ = tx.send(JobMsg::Done(*idx, result.clone()));
+                }
                 ctx.request_repaint();
             }
             let _ = tx.send(JobMsg::Finished);
@@ -614,7 +645,7 @@ impl App {
                     ui.label(&c.issuer);
                     ui.end_row();
                     ui.label(RichText::new(t().valid).weak());
-                    let valid = format!("{} – {}", c.not_before.format("%d.%m.%Y"), c.not_after.format("%d.%m.%Y"));
+                    let valid = format!("{} - {}", c.not_before.format("%d.%m.%Y"), c.not_after.format("%d.%m.%Y"));
                     ui.label(if c.is_valid_now() { RichText::new(valid) } else { RichText::new(format!("{valid} {}", t().expired)).color(Color32::from_rgb(210, 60, 60)) });
                     ui.end_row();
                     ui.label(RichText::new(t().purpose).weak());
@@ -706,6 +737,7 @@ impl App {
                 let before = self.cades_format;
                 ui.radio_value(&mut self.cades_format, cades::Format::Detached, t().p7s_label);
                 ui.radio_value(&mut self.cades_format, cades::Format::Enveloping, t().p7m_label);
+                ui.radio_value(&mut self.cades_format, cades::Format::Asice, t().asice_label).on_hover_text(t().asice_hint);
                 if self.cades_format != before {
                     settings::set("cades", self.cades_format.code());
                 }

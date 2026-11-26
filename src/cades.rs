@@ -13,6 +13,8 @@ pub enum Format {
     Detached,
     /// The file is embedded in the signature (`.p7m`).
     Enveloping,
+    /// All non-PDF files in one ASiC-E container (see `asic`); not a format for [`sign`].
+    Asice,
 }
 
 impl Format {
@@ -20,6 +22,7 @@ impl Format {
         match self {
             Format::Detached => "p7s",
             Format::Enveloping => "p7m",
+            Format::Asice => "asice",
         }
     }
 
@@ -28,7 +31,11 @@ impl Format {
     }
 
     pub fn from_code(s: &str) -> Format {
-        if s == "p7m" { Format::Enveloping } else { Format::Detached }
+        match s {
+            "p7m" => Format::Enveloping,
+            "asice" => Format::Asice,
+            _ => Format::Detached,
+        }
     }
 }
 

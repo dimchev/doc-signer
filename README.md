@@ -13,6 +13,7 @@ Prebuilt binaries (built from `master` by GitHub Actions) are on the [Releases p
 
 - Sign one or many PDF files (button, `Ctrl+O`, drag & drop of files or a folder, or command-line arguments).
 - **Any other file** (docx, xlsx, odt, images, zip, …) is signed as a whole with a CAdES signature: **`.p7s`** (separate signature file, the original stays unchanged) or **`.p7m`** (the file embedded in the signature). Verify e.g. with `openssl cms -verify -binary -inform DER -in file.docx.p7s -content file.docx -CAfile <root>` or the EU DSS validator.
+- **ASiC-E container** (`.asice`, ETSI EN 319 162-1): choose *.asice* under Output to pack all checked non-PDF files into one ZIP with `META-INF/ASiCManifest.xml` (SHA-256 of every file) and one CAdES signature over it (`META-INF/signature001.p7s`). The container is named after the first file. Open it with any ZIP tool, or validate it with the EU DSS validator.
 - Choose a personal certificate with a private key. Certificates with the document-signing extended key usage are sorted to the top and marked with ★.
 - The signature is PAdES (`ETSI.CAdES.detached`, SHA-256) and is added as an *incremental update*, so existing signatures stay valid.
 - Optional visible stamp (name, date, reason, location - Cyrillic included). Position it by clicking or dragging on the page preview and **resize it by dragging a corner** (Shift keeps the proportions); by default it is placed at the bottom-right of the last page. Each document can use its own style (🎨 on the document card).
@@ -108,6 +109,7 @@ CI does this on Linux (OpenSSL key from a file) and on Windows (a throwaway CNG 
 - Encrypted (password-protected) PDFs are not supported.
 - Without a time stamp the signature is PAdES **B-B**; with *Add trusted timestamp (TSA)* it is **B-T**. No LTV data yet (B-LT, #38).
 - RSA and ECDSA keys are supported (ECDSA on Windows only as CNG keys; legacy CSP keys are RSA-only).
+- ASiC-E containers are created, not opened or extended; a container is limited to 4 GB (no ZIP64). PDFs are always signed as PAdES and not packed into the container.
 
 ## Third-party
 

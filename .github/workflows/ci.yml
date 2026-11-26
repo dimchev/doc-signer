@@ -72,6 +72,30 @@ jobs:
             echo "tampered file verified - this must fail"; exit 1
           fi
 
+      # ASiC-E container (#36): ZIP layout, manifest digests and the CAdES signature over the manifest.
+      - name: E2E .asice verified with Python zipfile and OpenSSL
+        run: |
+          set -euo pipefail
+          mkdir -p ci-test/asic
+          printf 'Doc Signer CI - ASiC-E\n' > "ci-test/asic/договор 1.txt"
+          DOC_SIGNER_TEST_PDF="$GITHUB_WORKSPACE/ci-test/asic/договор 1.txt" cargo test asice_with -- --include-ignored --nocapture
+          python - "ci-test/asic/договор 1.txt.asice" ci-test/asic/x <<'PY'
+          import base64, hashlib, sys, zipfile
+          z = zipfile.ZipFile(sys.argv[1])
+          assert z.testzip() is None
+          first = z.infolist()[0]
+          assert first.filename == "mimetype" and first.compress_type == zipfile.ZIP_STORED
+          assert z.read("mimetype") == b"application/vnd.etsi.asic-e+zip"
+          manifest = z.read("META-INF/ASiCManifest.xml").decode()
+          for n in z.namelist():
+              if n != "mimetype" and not n.startswith("META-INF/"):
+                  digest = base64.b64encode(hashlib.sha256(z.read(n)).digest()).decode()
+                  assert f"<ds:DigestValue>{digest}</ds:DigestValue>" in manifest, n
+          z.extractall(sys.argv[2])
+          print("ASiC-E layout OK:", z.namelist())
+          PY
+          openssl cms -verify -binary -inform DER -in ci-test/asic/x/META-INF/signature001.p7s -content ci-test/asic/x/META-INF/ASiCManifest.xml -CAfile ci-test/certs/ci.crt -purpose any -out /dev/null
+
       # PAdES B-T with a real public TSA (#34).
       - name: E2E with an RFC 3161 time-stamp
         env:
