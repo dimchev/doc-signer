@@ -85,6 +85,15 @@ export DOC_SIGNER_THUMB="<SHA-1 fingerprint of the certificate, 40 hex chars>"
 cargo test -- --include-ignored
 ```
 
+The test writes `<file>.pdf.signed.pdf`. To validate it independently (pyhanko: integrity, signature, trust chain and the PAdES signed attributes), run:
+
+```sh
+pip install pyhanko pyhanko-certvalidator
+python scripts/validate_signature.py /path/to/file.pdf.signed.pdf /path/to/signer-or-root.crt
+```
+
+CI does this on Linux (OpenSSL key from a file) and on Windows (a throwaway CNG key in `CurrentUser\My`), using the fixture `tests/fixtures/minimal.pdf`.
+
 ## Limitations
 
 - Encrypted (password-protected) PDFs are not supported.
