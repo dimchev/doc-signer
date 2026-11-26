@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Manual run (any branch): builds and packages, uploads the assets as a workflow artifact
+  # instead of a release. Used to test packaging without creating a tag.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -73,12 +76,39 @@ jobs:
           if [ "${{ runner.os }}" = "Linux" ]; then
             tar czf "dist/${{ matrix.asset }}" -C dist doc-signer libpdfium.so
           else
-            # bsdtar on Windows writes zip when -a infers the format from the extension
-            (cd dist && tar -a -cf "${{ matrix.asset }}" doc-signer.exe pdfium.dll)
+            # In this bash shell `tar` is GNU tar (Git for Windows), which cannot write zip
+            # (-a would silently produce a plain tar). 7-Zip is preinstalled on the runners.
+            (cd dist && 7z a -tzip -bd "${{ matrix.asset }}" doc-signer.exe pdfium.dll)
           fi
           ls -la dist/
 
+      - name: Verify asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSET="dist/${{ matrix.asset }}"
+          case "$ASSET" in
+            *.zip)
+              python -c "import sys, zipfile; z = zipfile.ZipFile(sys.argv[1]); bad = z.testzip(); assert bad is None, bad; names = set(z.namelist()); need = {'doc-signer.exe', 'pdfium.dll'}; assert need <= names, names; print('zip OK:', sorted(names))" "$ASSET"
+              ;;
+            *.tar.gz)
+              LIST="$(tar -tzf "$ASSET")"
+              echo "$LIST"
+              grep -qx "doc-signer" <<< "$LIST"
+              grep -qx "libpdfium.so" <<< "$LIST"
+              echo "tar.gz OK"
+              ;;
+          esac
+
+      - name: Upload workflow artifact (manual runs)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+
       - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/${{ matrix.asset }}
