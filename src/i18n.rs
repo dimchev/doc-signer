@@ -575,6 +575,11 @@ pub static ES: Tr = Tr {
 
 /// Strings of the stamp-style UI.
 pub struct StyleTr {
+    pub from_pdf: &'static str,
+    pub pick_title: &'static str,
+    pub pick_warning: &'static str,
+    pub no_appearances: &'static str,
+    pub signer_page: &'static str,
     pub shape_seal: &'static str,
     pub seal_style: &'static str,
     pub top_arc: &'static str,
@@ -682,6 +687,11 @@ pub struct StyleTr {
 }
 
 pub static EN_STYLE: StyleTr = StyleTr {
+    from_pdf: "From signed PDF…",
+    pick_title: "Signature appearances in the PDF",
+    pick_warning: "Use only appearances you own or are authorised to use. The digital signature always shows the real signer.",
+    no_appearances: "No visible signatures found in this PDF",
+    signer_page: "{signer} · page {page}",
     shape_seal: "Seal",
     seal_style: "Round seal",
     top_arc: "top arc",
@@ -789,6 +799,11 @@ pub static EN_STYLE: StyleTr = StyleTr {
 };
 
 pub static BG_STYLE: StyleTr = StyleTr {
+    from_pdf: "От подписан PDF…",
+    pick_title: "Видими подписи в PDF файла",
+    pick_warning: "Използвай само визии, които са твои или имаш право да ползваш. Цифровият подпис винаги показва реалния подписващ.",
+    no_appearances: "В този PDF няма видими подписи",
+    signer_page: "{signer} · стр. {page}",
     shape_seal: "Печат",
     seal_style: "Кръгъл печат",
     top_arc: "горна дъга",
@@ -896,6 +911,11 @@ pub static BG_STYLE: StyleTr = StyleTr {
 };
 
 pub static DE_STYLE: StyleTr = StyleTr {
+    from_pdf: "Aus signierter PDF…",
+    pick_title: "Signaturdarstellungen in der PDF",
+    pick_warning: "Verwende nur Darstellungen, die dir gehören oder die du verwenden darfst. Die digitale Signatur zeigt immer den tatsächlichen Unterzeichner.",
+    no_appearances: "Keine sichtbaren Signaturen in dieser PDF gefunden",
+    signer_page: "{signer} · Seite {page}",
     shape_seal: "Siegel",
     seal_style: "Rundes Siegel",
     top_arc: "oberer Bogen",
@@ -1003,6 +1023,11 @@ pub static DE_STYLE: StyleTr = StyleTr {
 };
 
 pub static ES_STYLE: StyleTr = StyleTr {
+    from_pdf: "Desde PDF firmado…",
+    pick_title: "Apariencias de firma en el PDF",
+    pick_warning: "Usa solo apariencias que sean tuyas o que estés autorizado a usar. La firma digital siempre muestra al firmante real.",
+    no_appearances: "No se encontraron firmas visibles en este PDF",
+    signer_page: "{signer} · página {page}",
     shape_seal: "Sello",
     seal_style: "Sello redondo",
     top_arc: "arco superior",
