@@ -134,6 +134,8 @@ pub struct Visible {
     pub page: usize,
     /// x, y, w, h in display points, origin top-left.
     pub rect: [f32; 4],
+    /// The stamp image, stretched over `rect`.
+    pub image: stamp::Rendered,
 }
 
 pub struct SignRequest {
@@ -143,10 +145,6 @@ pub struct SignRequest {
     pub contact: String,
     pub time: DateTime<Local>,
     pub visible: Option<Visible>,
-}
-
-pub fn stamp_date(t: &DateTime<Local>) -> String {
-    t.format("%d.%m.%Y %H:%M:%S %:z").to_string()
 }
 
 // ---------- serialization ----------
@@ -296,10 +294,7 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     let sig_id = alloc();
     let widget_id = alloc();
 
-    let (page_idx, rect) = match &req.visible {
-        Some(v) => (v.page.min(pages.len() - 1), Some(v.rect)),
-        None => (0, None),
-    };
+    let page_idx = req.visible.as_ref().map_or(0, |v| v.page.min(pages.len() - 1));
     let (page_id, geom) = pages[page_idx];
 
     let mut widget = Dictionary::new();
@@ -311,14 +306,15 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     widget.set("F", 132i64);
     widget.set("P", Object::Reference(page_id));
 
-    match rect {
-        Some(r) => {
+    match &req.visible {
+        Some(v) => {
+            let r = v.rect;
             let user = geom.display_rect_to_user(r);
             widget.set("Rect", Object::Array(user.iter().map(|&v| Object::Real(v)).collect()));
 
             let (w_pt, h_pt) = (r[2], r[3]);
-            let lines = stamp::lines(&req.signer_name, &stamp_date(&req.time), &req.reason, &req.location);
-            let mask = stamp::render(&lines, w_pt, h_pt, 4.0);
+            let img = &v.image;
+            let (rgb, alpha) = img.rgb_and_alpha();
 
             let smask_id = alloc();
             let image_id = alloc();
@@ -327,29 +323,23 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
             let mut sm = Dictionary::new();
             sm.set("Type", Object::Name(b"XObject".to_vec()));
             sm.set("Subtype", Object::Name(b"Image".to_vec()));
-            sm.set("Width", mask.width as i64);
-            sm.set("Height", mask.height as i64);
+            sm.set("Width", img.width as i64);
+            sm.set("Height", img.height as i64);
             sm.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
             sm.set("BitsPerComponent", 8i64);
-            objects.push((smask_id, stream_obj(sm, &mask.alpha, true)));
+            objects.push((smask_id, stream_obj(sm, &alpha, true)));
 
             let mut im = Dictionary::new();
             im.set("Type", Object::Name(b"XObject".to_vec()));
             im.set("Subtype", Object::Name(b"Image".to_vec()));
-            im.set("Width", mask.width as i64);
-            im.set("Height", mask.height as i64);
+            im.set("Width", img.width as i64);
+            im.set("Height", img.height as i64);
             im.set("ColorSpace", Object::Name(b"DeviceRGB".to_vec()));
             im.set("BitsPerComponent", 8i64);
             im.set("SMask", Object::Reference(smask_id));
-            let rgb: Vec<u8> = stamp::INK.iter().copied().cycle().take((mask.width * mask.height * 3) as usize).collect();
             objects.push((image_id, stream_obj(im, &rgb, true)));
 
-            let [r0, g0, b0] = stamp::INK.map(|c| c as f32 / 255.0);
-            let content = format!(
-                "q {w_pt} 0 0 {h_pt} 0 0 cm /Im1 Do Q\nq {r0:.3} {g0:.3} {b0:.3} RG 0.8 w 0.4 0.4 {} {} re S Q\n",
-                w_pt - 0.8,
-                h_pt - 0.8
-            );
+            let content = format!("q {w_pt} 0 0 {h_pt} 0 0 cm /Im1 Do Q\n");
             let mut form = Dictionary::new();
             form.set("Type", Object::Name(b"XObject".to_vec()));
             form.set("Subtype", Object::Name(b"Form".to_vec()));
@@ -558,14 +548,28 @@ mod tests {
             }
             None => (info.pages.len() - 1, [300.0, 600.0, 190.0, 62.0]),
         };
-        let req = SignRequest {
-            signer_name: env_or("DOC_SIGNER_NAME", "Test Signer".into()),
-            reason: env_or("DOC_SIGNER_REASON", "Approved".into()),
-            location: env_or("DOC_SIGNER_LOCATION", "Testville".into()),
-            contact: env_or("DOC_SIGNER_CONTACT", String::new()),
-            time: chrono::Local::now(),
-            visible: Some(Visible { page, rect }),
+        let (signer_name, reason, location, contact) = (
+            env_or("DOC_SIGNER_NAME", "Test Signer".into()),
+            env_or("DOC_SIGNER_REASON", "Approved".into()),
+            env_or("DOC_SIGNER_LOCATION", "Testville".into()),
+            env_or("DOC_SIGNER_CONTACT", String::new()),
+        );
+        let time = chrono::Local::now();
+        // Optional DOC_SIGNER_STYLE=<style.json>; default is the built-in "Classic" style.
+        let style = match std::env::var("DOC_SIGNER_STYLE") {
+            Ok(p) => crate::style::parse(&std::fs::read_to_string(p).unwrap()).unwrap(),
+            Err(_) => crate::style::builtins().remove(0),
         };
+        let data = crate::style::StampData {
+            name: signer_name.clone(),
+            issuer: String::new(),
+            reason: reason.clone(),
+            location: location.clone(),
+            contact: contact.clone(),
+            time,
+        };
+        let image = stamp::render(&style, &data, rect[2], rect[3], 4.0);
+        let req = SignRequest { signer_name, reason, location, contact, time, visible: Some(Visible { page, rect, image }) };
         let out = sign_pdf(&bytes, &req, &signer, &|d| crate::certs::sign_data(&thumb, d, signer.alg)).unwrap();
         std::fs::write(format!("{input}.signed.pdf"), &out).unwrap();
         assert_eq!(inspect(&out).unwrap().signatures, info.signatures + 1);

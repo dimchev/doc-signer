@@ -27,12 +27,26 @@ pub const SYSTEM: Family = Family {
     symbols: &[],
 };
 
-/// Stamp fonts (regular, bold). On Windows Arial keeps the established stamp look.
-#[cfg(windows)]
-pub const STAMP: (&[&str], &[&str]) = (&["arial.ttf", "segoeui.ttf", "tahoma.ttf"], &["arialbd.ttf", "segoeuib.ttf"]);
-#[cfg(not(windows))]
-pub const STAMP: (&[&str], &[&str]) = (SYSTEM.regular, &["DejaVuSans-Bold.ttf", "NotoSans-Bold.ttf", "LiberationSans-Bold.ttf"]);
-
+/// Stamp font files (regular, bold) per family, in order of preference.
+/// On Windows Arial keeps the established stamp look for the sans family.
+pub fn stamp_files(family: crate::style::FontFamily) -> (&'static [&'static str], &'static [&'static str]) {
+    use crate::style::FontFamily::*;
+    #[cfg(windows)]
+    match family {
+        Sans => (&["arial.ttf", "segoeui.ttf", "tahoma.ttf"], &["arialbd.ttf", "segoeuib.ttf"]),
+        Serif => (&["times.ttf", "georgia.ttf", "cambria.ttc"], &["timesbd.ttf", "georgiab.ttf", "cambriab.ttf"]),
+        Mono => (&["consola.ttf", "cour.ttf"], &["consolab.ttf", "courbd.ttf"]),
+    }
+    #[cfg(not(windows))]
+    match family {
+        Sans => (SYSTEM.regular, &["DejaVuSans-Bold.ttf", "NotoSans-Bold.ttf", "LiberationSans-Bold.ttf"]),
+        Serif => (
+            &["DejaVuSerif.ttf", "NotoSerif-Regular.ttf", "LiberationSerif-Regular.ttf"],
+            &["DejaVuSerif-Bold.ttf", "NotoSerif-Bold.ttf", "LiberationSerif-Bold.ttf"],
+        ),
+        Mono => (SYSTEM.mono, &["DejaVuSansMono-Bold.ttf", "NotoSansMono-Bold.ttf", "LiberationMono-Bold.ttf"]),
+    }
+}
 /// Bytes of the first font in `names` that exists on this system.
 pub fn find(names: &[&str]) -> Option<Vec<u8>> {
     names.iter().find_map(|n| path_of(n)).and_then(|p| std::fs::read(p).ok())

@@ -6,7 +6,10 @@ mod cms;
 mod fonts;
 mod pdf;
 mod preview;
+mod settings;
 mod stamp;
+mod style;
+mod style_ui;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -95,6 +98,9 @@ struct App {
     contact: String,
     visible: bool,
     stamp_size: Vec2,
+    styles: style_ui::StyleUi,
+    /// Style id and default size last applied to `stamp_size`.
+    applied_style: (String, Vec2),
 
     output: Output,
     suffix: String,
@@ -103,7 +109,6 @@ struct App {
     log: Vec<(Level, String)>,
     previewer: preview::Previewer,
     page_tex: Option<(PathBuf, usize, Result<TextureHandle, String>)>,
-    stamp_tex: Option<(String, TextureHandle)>,
     job: Option<Receiver<JobMsg>>,
 }
 
@@ -122,13 +127,14 @@ impl App {
             contact: String::new(),
             visible: true,
             stamp_size: vec2(190.0, 62.0),
+            styles: style_ui::StyleUi::new(),
+            applied_style: (String::new(), Vec2::ZERO),
             output: Output::Suffix,
             suffix: t().default_suffix.into(),
             open_folder_after: false,
             log: Vec::new(),
             previewer: preview::Previewer::new(),
             page_tex: None,
-            stamp_tex: None,
             job: None,
         };
         if !app.previewer.available() {
@@ -137,11 +143,35 @@ impl App {
         if stamp::uses_builtin_font() {
             app.push(Level::Info, t().stamp_font_fallback);
         }
+        app.sync_style_size();
         app.reload_certs();
         for arg in std::env::args_os().skip(1) {
             app.add_file(PathBuf::from(arg));
         }
         app
+    }
+
+    /// Values shown in the stamp preview (the signing thread uses the time of signing).
+    fn stamp_data(&self) -> style::StampData {
+        let cert = self.current_cert();
+        style::StampData {
+            name: cert.map(|c| c.subject.clone()).unwrap_or_else(|| t().sample_name.into()),
+            issuer: cert.map(|c| c.issuer.clone()).unwrap_or_default(),
+            reason: self.reason.clone(),
+            location: self.location.clone(),
+            contact: self.contact.clone(),
+            time: Local::now(),
+        }
+    }
+
+    /// Selecting a style (or saving a new default size) resets the stamp size to the style's size.
+    fn sync_style_size(&mut self) {
+        let s = self.styles.current();
+        let key = (s.id.clone(), vec2(s.size.w, s.size.h));
+        if key != self.applied_style {
+            self.stamp_size = key.1;
+            self.applied_style = key;
+        }
     }
 
     fn push(&mut self, level: Level, msg: impl Into<String>) {
@@ -251,14 +281,14 @@ impl App {
 
     fn start_signing(&mut self, ctx: &egui::Context) {
         let Some(cert) = self.current_cert().cloned() else { return };
-        let tasks: Vec<(usize, PathBuf, PathBuf, Option<pdf::Visible>)> = self
+        let tasks: Vec<(usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>)> = self
             .docs
             .iter()
             .enumerate()
             .filter(|(_, d)| d.checked && d.info.is_ok())
             .map(|(i, d)| {
                 let visible = if self.visible {
-                    self.placement_for(d).map(|p| pdf::Visible { page: p.page, rect: [p.x, p.y, self.stamp_size.x, self.stamp_size.y] })
+                    self.placement_for(d).map(|p| (p.page, [p.x, p.y, self.stamp_size.x, self.stamp_size.y]))
                 } else {
                     None
                 };
@@ -276,6 +306,7 @@ impl App {
         let (tx, rx) = channel();
         self.job = Some(rx);
         let (reason, location, contact) = (self.reason.clone(), self.location.clone(), self.contact.clone());
+        let stamp_style = self.styles.current().clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let signer = certs::load_signer(&cert.thumbprint);
@@ -283,12 +314,24 @@ impl App {
                 let result = (|| -> anyhow::Result<PathBuf> {
                     let signer = signer.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
                     let input = std::fs::read(&src)?;
+                    let time = Local::now();
+                    let visible = visible.map(|(page, rect)| {
+                        let data = style::StampData {
+                            name: cert.subject.clone(),
+                            issuer: cert.issuer.clone(),
+                            reason: reason.clone(),
+                            location: location.clone(),
+                            contact: contact.clone(),
+                            time,
+                        };
+                        pdf::Visible { page, rect, image: stamp::render(&stamp_style, &data, rect[2], rect[3], 4.0) }
+                    });
                     let req = pdf::SignRequest {
                         signer_name: cert.subject.clone(),
                         reason: reason.clone(),
                         location: location.clone(),
                         contact: contact.clone(),
-                        time: Local::now(),
+                        time,
                         visible,
                     };
                     let out = pdf::sign_pdf(&input, &req, signer, &|d| certs::sign_data(&cert.thumbprint, d, signer.alg))?;
@@ -524,9 +567,12 @@ impl App {
             });
 
             ui.separator();
-            ui.heading(t().stamp_heading);
+            ui.heading(t().style.heading);
             ui.checkbox(&mut self.visible, t().stamp_enable);
+            let data = self.stamp_data();
             ui.add_enabled_ui(self.visible, |ui| {
+                self.styles.panel(ui, &data);
+                self.sync_style_size();
                 ui.label(RichText::new(t().stamp_hint).weak().small());
                 ui.add(egui::Slider::new(&mut self.stamp_size.x, 120.0..=320.0).text(t().width));
                 ui.add(egui::Slider::new(&mut self.stamp_size.y, 40.0..=120.0).text(t().height));
@@ -594,22 +640,9 @@ impl App {
     }
 
     fn stamp_texture(&mut self, ctx: &egui::Context) -> TextureHandle {
-        let name = self.current_cert().map(|c| c.subject.clone()).unwrap_or_else(|| t().sample_name.into());
-        let date = pdf::stamp_date(&Local::now());
-        let key = format!("{}|{name}|", i18n::current().code()) + &format!("{}|{}|{}|{}|{}", self.reason, self.location, self.stamp_size.x, self.stamp_size.y, &date[..16]);
-        if let Some((k, t)) = &self.stamp_tex {
-            if *k == key {
-                return t.clone();
-            }
-        }
-        let lines = stamp::lines(&name, &date, &self.reason, &self.location);
-        let mask = stamp::render(&lines, self.stamp_size.x, self.stamp_size.y, 3.0);
-        let [r, g, b] = stamp::INK;
-        let pixels = mask.alpha.iter().map(|&a| Color32::from_rgba_unmultiplied(r, g, b, a)).collect();
-        let img = egui::ColorImage::new([mask.width as usize, mask.height as usize], pixels);
-        let tex = ctx.load_texture("stamp", img, TextureOptions::LINEAR);
-        self.stamp_tex = Some((key, tex.clone()));
-        tex
+        let data = self.stamp_data();
+        let s = self.styles.current().clone();
+        self.styles.texture(ctx, "page", &s, &data, self.stamp_size.x, self.stamp_size.y, 3.0).0
     }
 
     fn preview_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -700,11 +733,11 @@ impl App {
                 let srect = egui::Rect::from_min_size(rect.min + vec2(p.x, p.y) * scale, self.stamp_size * scale);
                 let explicit = self.docs[sel].placement.is_some();
                 let tex = self.stamp_texture(ctx);
-                painter.rect_filled(srect, 2.0, Color32::from_rgba_unmultiplied(230, 238, 255, 170));
                 painter.image(tex.id(), srect, uv, Color32::WHITE);
-                let [r, g, b] = stamp::INK;
-                let stroke = Stroke::new(if explicit { 2.0 } else { 1.0 }, Color32::from_rgb(r, g, b));
-                painter.rect_stroke(srect, 2.0, stroke, StrokeKind::Outside);
+                // Placement frame (not part of the stamp).
+                let accent = ui.visuals().selection.bg_fill;
+                let stroke = Stroke::new(if explicit { 1.5 } else { 1.0 }, accent.gamma_multiply(0.8));
+                painter.rect_stroke(srect.expand(2.0), 2.0, stroke, StrokeKind::Outside);
                 if !explicit {
                     painter.text(srect.left_top() - vec2(0.0, 4.0), egui::Align2::LEFT_BOTTOM, t().default_pos, egui::FontId::proportional(11.0), Color32::GRAY);
                 }
@@ -744,7 +777,7 @@ impl App {
         }
         i18n::set(lang);
         i18n::save(lang);
-        self.stamp_tex = None;
+        self.styles.reload();
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(t().window_title.into()));
     }
 
@@ -796,6 +829,16 @@ impl eframe::App for App {
         egui::Panel::left("docs").resizable(true).default_size(320.0).size_range(240.0..=480.0).show(ui, |ui| self.documents_panel(ui));
         egui::Panel::right("settings").resizable(true).default_size(360.0).size_range(320.0..=520.0).show(ui, |ui| self.settings_panel(ui, ctx));
         egui::CentralPanel::default().show(ui, |ui| self.preview_panel(ui, ctx));
+
+        let data = self.stamp_data();
+        self.styles.windows(ctx, &data);
+        for note in self.styles.take_notes() {
+            match note {
+                style_ui::Note::Ok(m) => self.push(Level::Ok, m),
+                style_ui::Note::Err(m) => self.push(Level::Err, m),
+            }
+        }
+        self.sync_style_size();
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop")));
