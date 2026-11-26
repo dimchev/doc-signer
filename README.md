@@ -22,7 +22,7 @@ Prebuilt binaries (built from `master` by GitHub Actions) are on the [Releases p
 
 ### Windows
 
-Certificates are read from the personal store (`CurrentUser\My`). The private key is used through Windows CNG — for smart cards, Windows itself shows the PIN prompt. Only CNG keys are supported (CSP-only keys are not).
+Certificates are read from the personal store (`CurrentUser\My`). The private key is used through Windows CNG, or the legacy CryptoAPI (CSP) for older smart-card middleware (RSA with a provider that supports SHA-256) — for smart cards, Windows itself shows the PIN prompt.
 
 ### Linux
 
@@ -105,7 +105,7 @@ CI does this on Linux (OpenSSL key from a file) and on Windows (a throwaway CNG 
 
 - Encrypted (password-protected) PDFs are not supported.
 - No time stamp (TSA) and no LTV data; the signature is at PAdES **B-B** level.
-- RSA and ECDSA keys are supported (on Windows only CNG keys, see above).
+- RSA and ECDSA keys are supported (ECDSA on Windows only as CNG keys; legacy CSP keys are RSA-only).
 
 ## Third-party
 
