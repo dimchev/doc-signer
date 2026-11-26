@@ -16,6 +16,7 @@ Prebuilt binaries (built from `master` by GitHub Actions) are on the [Releases p
 - The signature is PAdES (`ETSI.CAdES.detached`, SHA-256) and is added as an *incremental update*, so existing signatures stay valid.
 - Optional visible stamp (name, date, reason, location — Cyrillic included). Position it by clicking or dragging on the page preview and **resize it by dragging a corner** (Shift keeps the proportions); by default it is placed at the bottom-right of the last page. Each document can use its own style (🎨 on the document card).
 - **Stamp styles**: pick a style in the gallery (Classic, Minimal, Badge, Corporate, Handwritten, Round seal) or create your own with *Edit…* — shape (rectangle, rounded, ellipse, **round seal** with text along the arcs, no border), colours, border (single/double/dashed), font, an **image** (handwritten signature, logo or company seal — from PNG / JPG / SVG / PDF, drawn in the app, or **taken from a signature in an already signed PDF** (e.g. made with Adobe, B-Trust, Evrotrust or pyHanko — needs pdfium); white backgrounds of scans are removed automatically; placed left, right, on top or behind the text), and which fields are shown in which order (with `{name}`, `{date}`, `{reason}`, `{location}`, `{issuer}`, `{contact}` placeholders). The "Digitally signed by" label and the signer's name are always shown. Styles are stored in `%APPDATA%\DocSigner\styles` (Linux: `~/.config/DocSigner/styles`) and can be shared with *⋯ → Export / Import* (`.json`); a style saved as *locked* can only be duplicated. See [docs/design/stamp-appearance.md](docs/design/stamp-appearance.md).
+- Optional **trusted timestamp** (RFC 3161, PAdES B-T): the signing time comes from a time-stamp authority (default `http://timestamp.digicert.com`, configurable) instead of the PC clock. Only a hash of the signature is sent. If the TSA cannot be reached, signing fails rather than silently producing a signature without the timestamp.
 - The result is a new file with a suffix (default ` - signed`) or an overwrite of the original.
 
 ## Certificates
@@ -104,7 +105,7 @@ CI does this on Linux (OpenSSL key from a file) and on Windows (a throwaway CNG 
 ## Limitations
 
 - Encrypted (password-protected) PDFs are not supported.
-- No time stamp (TSA) and no LTV data; the signature is at PAdES **B-B** level.
+- Without a time stamp the signature is PAdES **B-B**; with *Add trusted timestamp (TSA)* it is **B-T**. No LTV data yet (B-LT, #38).
 - RSA and ECDSA keys are supported (ECDSA on Windows only as CNG keys; legacy CSP keys are RSA-only).
 
 ## Third-party

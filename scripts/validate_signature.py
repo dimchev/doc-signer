@@ -1,10 +1,11 @@
 """Independent validation of PDFs signed by doc-signer (used by CI).
 
-Usage: python scripts/validate_signature.py <signed.pdf> <trust-root.(pem|der|cer|crt)>
+Usage: python scripts/validate_signature.py <signed.pdf> <trust-root.(pem|der|cer|crt)> [--expect-timestamp]
 
 Fails (exit code 1) unless every signature is intact, cryptographically valid,
 chains to the given trust root and carries the signed attributes PAdES B-B needs.
-The last signature must also cover the entire file.
+The last signature must also cover the entire file. With --expect-timestamp every signature
+must carry an intact, valid RFC 3161 signature time-stamp (PAdES B-T).
 """
 
 import sys
@@ -25,7 +26,7 @@ REQUIRED_ATTRS = {
 }
 
 
-def main(pdf_path: str, trust_path: str) -> int:
+def main(pdf_path: str, trust_path: str, expect_timestamp: bool = False) -> int:
     vc = ValidationContext(trust_roots=[load_cert_from_pemder(trust_path)])
     errors = []
     with open(pdf_path, "rb") as f:
@@ -45,6 +46,14 @@ def main(pdf_path: str, trust_path: str) -> int:
                 errors.append(f"{sig.field_name}: signature is not intact/valid")
             if not status.trusted:
                 errors.append(f"{sig.field_name}: signer does not chain to the trust root")
+            if expect_timestamp:
+                ts = status.timestamp_validity
+                if ts is None:
+                    errors.append(f"{sig.field_name}: no signature time-stamp")
+                else:
+                    print(f"  time-stamp: {ts.timestamp} intact={ts.intact} valid={ts.valid}")
+                    if not (ts.intact and ts.valid):
+                        errors.append(f"{sig.field_name}: time-stamp is not intact/valid")
             if i == len(sigs) - 1 and status.coverage != SignatureCoverageLevel.ENTIRE_FILE:
                 errors.append(f"{sig.field_name}: last signature does not cover the entire file")
     for e in errors:
@@ -55,7 +64,8 @@ def main(pdf_path: str, trust_path: str) -> int:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
+    args = [a for a in sys.argv[1:] if a != "--expect-timestamp"]
+    if len(args) != 2:
         print(__doc__)
         sys.exit(2)
-    sys.exit(main(sys.argv[1], sys.argv[2]))
+    sys.exit(main(args[0], args[1], "--expect-timestamp" in sys.argv))
