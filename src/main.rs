@@ -60,6 +60,10 @@ struct Doc {
     checked: bool,
     status: Status,
     placement: Option<Placement>,
+    /// Stamp size in points set by resizing on the page; `None` = the style's default size.
+    size: Option<Vec2>,
+    /// Style id for this document only; `None` = the selected style.
+    style: Option<String>,
 }
 
 impl Doc {
@@ -98,10 +102,9 @@ struct App {
     location: String,
     contact: String,
     visible: bool,
-    stamp_size: Vec2,
     styles: style_ui::StyleUi,
-    /// Style id and default size last applied to `stamp_size`.
-    applied_style: (String, Vec2),
+    /// Corner being dragged on the page preview and the fixed opposite corner (page points).
+    resizing: Option<(usize, egui::Pos2)>,
 
     output: Output,
     suffix: String,
@@ -127,9 +130,8 @@ impl App {
             location: String::new(),
             contact: String::new(),
             visible: true,
-            stamp_size: vec2(190.0, 62.0),
             styles: style_ui::StyleUi::new(),
-            applied_style: (String::new(), Vec2::ZERO),
+            resizing: None,
             output: Output::Suffix,
             suffix: t().default_suffix.into(),
             open_folder_after: false,
@@ -144,7 +146,6 @@ impl App {
         if stamp::uses_builtin_font() {
             app.push(Level::Info, t().stamp_font_fallback);
         }
-        app.sync_style_size();
         app.reload_certs();
         for arg in std::env::args_os().skip(1) {
             app.add_file(PathBuf::from(arg));
@@ -165,14 +166,15 @@ impl App {
         }
     }
 
-    /// Selecting a style (or saving a new default size) resets the stamp size to the style's size.
-    fn sync_style_size(&mut self) {
-        let s = self.styles.current();
-        let key = (s.id.clone(), vec2(s.size.w, s.size.h));
-        if key != self.applied_style {
-            self.stamp_size = key.1;
-            self.applied_style = key;
-        }
+    fn doc_style(&self, d: &Doc) -> &style::Style {
+        d.style.as_deref().and_then(|id| self.styles.get(id)).unwrap_or_else(|| self.styles.current())
+    }
+
+    fn doc_size(&self, d: &Doc) -> Vec2 {
+        d.size.unwrap_or_else(|| {
+            let s = self.doc_style(d);
+            vec2(s.size.w, s.size.h)
+        })
     }
 
     fn push(&mut self, level: Level, msg: impl Into<String>) {
@@ -220,7 +222,7 @@ impl App {
             self.push(Level::Err, format!("{}: {e}", path.display()));
         }
         let checked = info.is_ok();
-        self.docs.push(Doc { path, info, checked, status: Status::Ready, placement: None });
+        self.docs.push(Doc { path, info, checked, status: Status::Ready, placement: None, size: None, style: None });
         if self.selected.is_none() {
             self.select(self.docs.len() - 1);
         }
@@ -236,24 +238,25 @@ impl App {
         };
     }
 
-    fn default_placement(&self, info: &PdfInfo) -> Placement {
+    fn default_placement(&self, info: &PdfInfo, size: Vec2) -> Placement {
         let page = info.pages.len() - 1;
         let (pw, ph) = info.pages[page].display_size();
         Placement {
             page,
-            x: (pw - self.stamp_size.x - MARGIN).max(0.0),
-            y: (ph - self.stamp_size.y - MARGIN).max(0.0),
+            x: (pw - size.x - MARGIN).max(0.0),
+            y: (ph - size.y - MARGIN).max(0.0),
         }
     }
 
     fn placement_for(&self, doc: &Doc) -> Option<Placement> {
         let info = doc.info.as_ref().ok()?;
-        let p = doc.placement.unwrap_or_else(|| self.default_placement(info));
+        let size = self.doc_size(doc);
+        let p = doc.placement.unwrap_or_else(|| self.default_placement(info, size));
         let (pw, ph) = info.pages[p.page].display_size();
         Some(Placement {
             page: p.page,
-            x: p.x.clamp(0.0, (pw - self.stamp_size.x).max(0.0)),
-            y: p.y.clamp(0.0, (ph - self.stamp_size.y).max(0.0)),
+            x: p.x.clamp(0.0, (pw - size.x).max(0.0)),
+            y: p.y.clamp(0.0, (ph - size.y).max(0.0)),
         })
     }
 
@@ -282,18 +285,19 @@ impl App {
 
     fn start_signing(&mut self, ctx: &egui::Context) {
         let Some(cert) = self.current_cert().cloned() else { return };
-        let tasks: Vec<(usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>)> = self
+        let tasks: Vec<(usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>, style::Style)> = self
             .docs
             .iter()
             .enumerate()
             .filter(|(_, d)| d.checked && d.info.is_ok())
             .map(|(i, d)| {
                 let visible = if self.visible {
-                    self.placement_for(d).map(|p| (p.page, [p.x, p.y, self.stamp_size.x, self.stamp_size.y]))
+                    let size = self.doc_size(d);
+                    self.placement_for(d).map(|p| (p.page, [p.x, p.y, size.x, size.y]))
                 } else {
                     None
                 };
-                (i, d.path.clone(), self.output_path(&d.path), visible)
+                (i, d.path.clone(), self.output_path(&d.path), visible, self.doc_style(d).clone())
             })
             .collect();
         if tasks.is_empty() {
@@ -307,11 +311,10 @@ impl App {
         let (tx, rx) = channel();
         self.job = Some(rx);
         let (reason, location, contact) = (self.reason.clone(), self.location.clone(), self.contact.clone());
-        let stamp_style = self.styles.current().clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let signer = certs::load_signer(&cert.thumbprint);
-            for (idx, src, dst, visible) in tasks {
+            for (idx, src, dst, visible, stamp_style) in tasks {
                 let result = (|| -> anyhow::Result<PathBuf> {
                     let signer = signer.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
                     let input = std::fs::read(&src)?;
@@ -447,6 +450,23 @@ impl App {
                             if ui.add_enabled(!busy, egui::Button::new("✖").small()).on_hover_text(t().remove_tip).clicked() {
                                 remove = Some(i);
                             }
+                            ui.menu_button("🎨", |ui| {
+                                ui.label(RichText::new(t().style.doc_style).strong());
+                                if ui.radio(doc.style.is_none(), t().style.use_selected).clicked() {
+                                    doc.style = None;
+                                    doc.size = None;
+                                    ui.close();
+                                }
+                                for s in self.styles.all() {
+                                    if ui.radio(doc.style.as_deref() == Some(s.id.as_str()), &s.name).clicked() {
+                                        doc.style = Some(s.id.clone());
+                                        doc.size = None;
+                                        ui.close();
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(t().style.doc_style);
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 let name = ui.add(egui::Label::new(RichText::new(doc.name()).strong()).truncate().sense(Sense::click()));
                                 if name.clicked() {
@@ -466,6 +486,9 @@ impl App {
                             }
                             if doc.placement.is_some() {
                                 s += &format!(" · {}", t().placed);
+                            }
+                            if let Some(st) = doc.style.as_deref().and_then(|id| self.styles.get(id)) {
+                                s += &format!(" · 🎨 {}", st.name);
                             }
                             RichText::new(s).weak().small()
                         }
@@ -507,7 +530,9 @@ impl App {
     }
 
     fn settings_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        // No auto-shrink: content always takes exactly the panel width, so wide content (e.g. the
+        // style gallery) wraps instead of keeping a stale, wider layout from an earlier frame.
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.heading(t().cert_heading);
             let visible = self.visible_certs();
             let label = self.current_cert().map(|c| c.subject.clone()).unwrap_or_else(|| t().choose.into());
@@ -573,26 +598,25 @@ impl App {
             let data = self.stamp_data();
             ui.add_enabled_ui(self.visible, |ui| {
                 self.styles.panel(ui, &data);
-                self.sync_style_size();
                 ui.label(RichText::new(t().stamp_hint).weak().small());
-                ui.add(egui::Slider::new(&mut self.stamp_size.x, 120.0..=320.0).text(t().width));
-                ui.add(egui::Slider::new(&mut self.stamp_size.y, 40.0..=120.0).text(t().height));
                 ui.horizontal_wrapped(|ui| {
                     if ui.button(t().reset_pos).clicked() {
                         for d in &mut self.docs {
                             d.placement = None;
+                            d.size = None;
                         }
                     }
-                    let current = self.selected.and_then(|i| self.docs[i].placement);
+                    let current = self.selected.and_then(|i| self.docs[i].placement.map(|p| (p, self.docs[i].size)));
                     if ui
                         .add_enabled(current.is_some(), egui::Button::new(t().apply_all))
                         .on_hover_text(t().apply_all_tip)
                         .clicked()
                     {
-                        let p = current.unwrap();
+                        let (p, size) = current.unwrap();
                         for d in &mut self.docs {
                             if let Ok(info) = &d.info {
                                 d.placement = Some(Placement { page: p.page.min(info.pages.len() - 1), ..p });
+                                d.size = size;
                             }
                         }
                     }
@@ -640,10 +664,11 @@ impl App {
         });
     }
 
-    fn stamp_texture(&mut self, ctx: &egui::Context) -> TextureHandle {
+    fn stamp_texture(&mut self, ctx: &egui::Context, doc: usize) -> TextureHandle {
         let data = self.stamp_data();
-        let s = self.styles.current().clone();
-        self.styles.texture(ctx, "page", &s, &data, self.stamp_size.x, self.stamp_size.y, 3.0).0
+        let s = self.doc_style(&self.docs[doc]).clone();
+        let size = self.doc_size(&self.docs[doc]);
+        self.styles.texture(ctx, "page", &s, &data, size.x, size.y, 3.0).0
     }
 
     fn preview_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -719,21 +744,25 @@ impl App {
         if !self.visible {
             return;
         }
+        if resp.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+        }
+        let size = self.doc_size(&self.docs[sel]);
         if (resp.clicked() || resp.dragged())
             && let Some(pos) = resp.interact_pointer_pos()
         {
             let local = (pos - rect.min) / scale;
             self.docs[sel].placement = Some(Placement {
                 page: self.page,
-                x: (local.x - self.stamp_size.x / 2.0).clamp(0.0, (pw - self.stamp_size.x).max(0.0)),
-                y: (local.y - self.stamp_size.y / 2.0).clamp(0.0, (ph - self.stamp_size.y).max(0.0)),
+                x: (local.x - size.x / 2.0).clamp(0.0, (pw - size.x).max(0.0)),
+                y: (local.y - size.y / 2.0).clamp(0.0, (ph - size.y).max(0.0)),
             });
         }
         if let Some(p) = self.placement_for(&self.docs[sel]) {
             if p.page == self.page {
-                let srect = egui::Rect::from_min_size(rect.min + vec2(p.x, p.y) * scale, self.stamp_size * scale);
+                let srect = egui::Rect::from_min_size(rect.min + vec2(p.x, p.y) * scale, size * scale);
                 let explicit = self.docs[sel].placement.is_some();
-                let tex = self.stamp_texture(ctx);
+                let tex = self.stamp_texture(ctx, sel);
                 painter.image(tex.id(), srect, uv, Color32::WHITE);
                 // Placement frame (not part of the stamp).
                 let accent = ui.visuals().selection.bg_fill;
@@ -742,12 +771,51 @@ impl App {
                 if !explicit {
                     painter.text(srect.left_top() - vec2(0.0, 4.0), egui::Align2::LEFT_BOTTOM, t().default_pos, egui::FontId::proportional(11.0), Color32::GRAY);
                 }
+                self.resize_handles(ui, ctx, sel, rect, srect, scale, (pw, ph), size);
             } else {
                 painter.text(rect.center_top() + vec2(0.0, 12.0), egui::Align2::CENTER_TOP, t().stamp_on_page.replace("{n}", &(p.page + 1).to_string()), egui::FontId::proportional(13.0), Color32::GRAY);
             }
         }
-        if resp.hovered() {
-            ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+
+    /// Corner handles on the stamp: drag to resize around the opposite corner. Shift keeps the
+    /// proportions; a round seal always does.
+    #[allow(clippy::too_many_arguments)]
+    fn resize_handles(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, sel: usize, page: egui::Rect, srect: egui::Rect, scale: f32, (pw, ph): (f32, f32), size: Vec2) {
+        const MIN: Vec2 = vec2(30.0, 20.0);
+        let keep_aspect = self.doc_style(&self.docs[sel]).shape == style::Shape::Seal || ui.input(|i| i.modifiers.shift);
+        let corners = [srect.left_top(), srect.right_top(), srect.left_bottom(), srect.right_bottom()];
+        let accent = ui.visuals().selection.bg_fill;
+        for (ci, c) in corners.iter().enumerate() {
+            let hr = egui::Rect::from_center_size(*c, vec2(10.0, 10.0));
+            let h = ui.interact(hr, ui.scope_id().with(("stamp-resize", ci)), Sense::drag());
+            ui.painter().rect_filled(hr.shrink(1.0), 2.0, accent);
+            ui.painter().rect_stroke(hr.shrink(1.0), 2.0, Stroke::new(1.0, Color32::WHITE), StrokeKind::Inside);
+            if h.hovered() || h.dragged() {
+                ctx.set_cursor_icon(if ci == 0 || ci == 3 { egui::CursorIcon::ResizeNwSe } else { egui::CursorIcon::ResizeNeSw });
+            }
+            if h.drag_started() {
+                self.resizing = Some((ci, ((corners[3 - ci] - page.min) / scale).to_pos2()));
+            }
+            if h.dragged()
+                && let (Some((_, anchor)), Some(pos)) = (self.resizing, h.interact_pointer_pos())
+            {
+                let cur = ((pos - page.min) / scale).to_pos2();
+                let mut w = (cur.x - anchor.x).abs().clamp(MIN.x, pw);
+                let mut hh = (cur.y - anchor.y).abs().clamp(MIN.y, ph);
+                if keep_aspect {
+                    let a = size.x / size.y;
+                    if w / hh > a { hh = (w / a).min(ph) } else { w = (hh * a).min(pw) }
+                }
+                let x = if cur.x < anchor.x { anchor.x - w } else { anchor.x };
+                let y = if cur.y < anchor.y { anchor.y - hh } else { anchor.y };
+                let doc = &mut self.docs[sel];
+                doc.placement = Some(Placement { page: self.page, x: x.clamp(0.0, (pw - w).max(0.0)), y: y.clamp(0.0, (ph - hh).max(0.0)) });
+                doc.size = Some(vec2(w, hh));
+            }
+            if h.drag_stopped() {
+                self.resizing = None;
+            }
         }
     }
 
@@ -839,7 +907,6 @@ impl eframe::App for App {
                 style_ui::Note::Err(m) => self.push(Level::Err, m),
             }
         }
-        self.sync_style_size();
 
         if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
             let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("drop")));

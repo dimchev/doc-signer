@@ -154,8 +154,6 @@ pub struct Tr {
 
     pub stamp_enable: &'static str,
     pub stamp_hint: &'static str,
-    pub width: &'static str,
-    pub height: &'static str,
     pub reset_pos: &'static str,
     pub apply_all: &'static str,
     pub apply_all_tip: &'static str,
@@ -251,9 +249,7 @@ pub static EN: Tr = Tr {
     contact: "Contact",
     contact_hint: "email or phone (optional)",
     stamp_enable: "Place a visible stamp on the page",
-    stamp_hint: "Click or drag on the preview to place the stamp. Default: bottom right of the last page.",
-    width: "width (pt)",
-    height: "height (pt)",
+    stamp_hint: "Click or drag on the page to place the stamp; drag a corner to resize (Shift keeps the proportions). Default: bottom right of the last page.",
     reset_pos: "Reset positions",
     apply_all: "Apply position to all",
     apply_all_tip: "Same page (or the last one if there are fewer) and same spot",
@@ -343,9 +339,7 @@ pub static BG: Tr = Tr {
     contact: "Контакт",
     contact_hint: "имейл или телефон (по желание)",
     stamp_enable: "Постави видим печат върху страницата",
-    stamp_hint: "Щракни или влачи върху прегледа, за да поставиш печата. Без избор – долу вдясно на последната страница.",
-    width: "ширина (pt)",
-    height: "височина (pt)",
+    stamp_hint: "Щракни или влачи върху страницата, за да поставиш печата; влачи ъгъл, за да го оразмериш (Shift запазва пропорциите). По подразбиране – долу вдясно на последната страница.",
     reset_pos: "Нулирай позициите",
     apply_all: "Приложи позицията за всички",
     apply_all_tip: "Същата страница (или последната, ако няма толкова) и същото място",
@@ -435,9 +429,7 @@ pub static DE: Tr = Tr {
     contact: "Kontakt",
     contact_hint: "E-Mail oder Telefon (optional)",
     stamp_enable: "Sichtbaren Stempel auf der Seite platzieren",
-    stamp_hint: "Zum Platzieren in die Vorschau klicken oder ziehen. Standard: unten rechts auf der letzten Seite.",
-    width: "Breite (pt)",
-    height: "Höhe (pt)",
+    stamp_hint: "Klicke oder ziehe auf der Seite, um den Stempel zu platzieren; ziehe an einer Ecke, um die Größe zu ändern (Umschalt behält die Proportionen). Standard: unten rechts auf der letzten Seite.",
     reset_pos: "Positionen zurücksetzen",
     apply_all: "Position für alle übernehmen",
     apply_all_tip: "Gleiche Seite (bzw. die letzte, falls weniger Seiten) und gleiche Stelle",
@@ -527,9 +519,7 @@ pub static ES: Tr = Tr {
     contact: "Contacto",
     contact_hint: "correo o teléfono (opcional)",
     stamp_enable: "Colocar un sello visible en la página",
-    stamp_hint: "Haz clic o arrastra en la vista previa para colocar el sello. Por defecto: abajo a la derecha de la última página.",
-    width: "ancho (pt)",
-    height: "alto (pt)",
+    stamp_hint: "Haz clic o arrastra en la página para colocar el sello; arrastra una esquina para cambiar el tamaño (Mayús mantiene las proporciones). Por defecto: abajo a la derecha de la última página.",
     reset_pos: "Restablecer posiciones",
     apply_all: "Aplicar posición a todos",
     apply_all_tip: "Misma página (o la última si hay menos) y mismo lugar",
@@ -575,6 +565,8 @@ pub static ES: Tr = Tr {
 
 /// Strings of the stamp-style UI.
 pub struct StyleTr {
+    pub doc_style: &'static str,
+    pub use_selected: &'static str,
     pub from_pdf: &'static str,
     pub pick_title: &'static str,
     pub pick_warning: &'static str,
@@ -687,6 +679,8 @@ pub struct StyleTr {
 }
 
 pub static EN_STYLE: StyleTr = StyleTr {
+    doc_style: "Style for this document",
+    use_selected: "Selected style (default)",
     from_pdf: "From signed PDF…",
     pick_title: "Signature appearances in the PDF",
     pick_warning: "Use only appearances you own or are authorised to use. The digital signature always shows the real signer.",
@@ -799,6 +793,8 @@ pub static EN_STYLE: StyleTr = StyleTr {
 };
 
 pub static BG_STYLE: StyleTr = StyleTr {
+    doc_style: "Стил за този документ",
+    use_selected: "Избраният стил (по подразбиране)",
     from_pdf: "От подписан PDF…",
     pick_title: "Видими подписи в PDF файла",
     pick_warning: "Използвай само визии, които са твои или имаш право да ползваш. Цифровият подпис винаги показва реалния подписващ.",
@@ -911,6 +907,8 @@ pub static BG_STYLE: StyleTr = StyleTr {
 };
 
 pub static DE_STYLE: StyleTr = StyleTr {
+    doc_style: "Stil für dieses Dokument",
+    use_selected: "Ausgewählter Stil (Standard)",
     from_pdf: "Aus signierter PDF…",
     pick_title: "Signaturdarstellungen in der PDF",
     pick_warning: "Verwende nur Darstellungen, die dir gehören oder die du verwenden darfst. Die digitale Signatur zeigt immer den tatsächlichen Unterzeichner.",
@@ -1023,6 +1021,8 @@ pub static DE_STYLE: StyleTr = StyleTr {
 };
 
 pub static ES_STYLE: StyleTr = StyleTr {
+    doc_style: "Estilo para este documento",
+    use_selected: "Estilo seleccionado (predeterminado)",
     from_pdf: "Desde PDF firmado…",
     pick_title: "Apariencias de firma en el PDF",
     pick_warning: "Usa solo apariencias que sean tuyas o que estés autorizado a usar. La firma digital siempre muestra al firmante real.",

@@ -169,6 +169,14 @@ impl StyleUi {
         std::mem::take(&mut self.notes)
     }
 
+    pub fn get(&self, id: &str) -> Option<&Style> {
+        self.styles.iter().find(|s| s.id == id)
+    }
+
+    pub fn all(&self) -> &[Style] {
+        &self.styles
+    }
+
     pub fn current(&self) -> &Style {
         self.styles.iter().find(|s| s.id == self.current).unwrap_or(&self.styles[0])
     }
@@ -288,11 +296,17 @@ impl StyleUi {
         let ts = &t().style;
         let ctx = ui.ctx().clone();
         let mut select = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-            let styles = self.styles.clone();
-            for s in &styles {
-                let thumb_w = 96.0;
+        // Explicit rows: horizontal_wrapped cannot wrap nested vertical items (their size is only
+        // known afterwards), which would force the panel wider with every additional style.
+        const THUMB_W: f32 = 96.0;
+        const GAP: f32 = 6.0;
+        let cols = (((ui.available_width() + GAP) / (THUMB_W + 8.0 + GAP)).floor() as usize).max(1);
+        let styles = self.styles.clone();
+        for row in styles.chunks(cols) {
+            ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = vec2(GAP, GAP);
+            for s in row {
+                let thumb_w = THUMB_W;
                 let scale = thumb_w / s.size.w * 2.0;
                 let (tex, _) = self.texture(&ctx, &format!("thumb-{}", s.id), s, data, s.size.w, s.size.h, scale);
                 let size = vec2(thumb_w, thumb_w * s.size.h / s.size.w).min(vec2(thumb_w, 56.0));
@@ -316,7 +330,8 @@ impl StyleUi {
                     ui.add(egui::Label::new(name).truncate());
                 });
             }
-        });
+            });
+        }
         if let Some(id) = select {
             self.select(&id);
         }
