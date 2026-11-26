@@ -390,7 +390,10 @@ fn resolve_array(doc: &Document, o: Option<&Object>) -> Vec<Object> {
 
 // ---------- signing ----------
 
-pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn Fn(&[u8]) -> Result<Vec<u8>>) -> Result<Vec<u8>> {
+/// Returns the RFC 3161 time-stamp token for the given signature value.
+pub type Timestamper<'a> = &'a dyn Fn(&[u8]) -> Result<Vec<u8>>;
+
+pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn Fn(&[u8]) -> Result<Vec<u8>>, timestamp: Option<Timestamper>) -> Result<Vec<u8>> {
     let doc = load(input)?;
     let prev_xref = startxref(input)?;
     let prev_is_stream = !input[prev_xref..].iter().skip_while(|c| c.is_ascii_whitespace()).take(4).eq(b"xref".iter());
@@ -519,7 +522,9 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     }
 
     // Signature dictionary with placeholders.
-    let contents_len = (signer.chain.iter().map(|c| c.len()).sum::<usize>() + 6000) * 2;
+    // A time-stamp token carries the TSA's certificate chain.
+    let ts_room = if timestamp.is_some() { 24_000 } else { 0 };
+    let contents_len = (signer.chain.iter().map(|c| c.len()).sum::<usize>() + 6000 + ts_room) * 2;
     let mut sig = Vec::new();
     sig.extend_from_slice(b"<</Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached");
     let mut put = |key: &str, val: &str| {
@@ -625,7 +630,11 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
 
     let attrs = cms::signed_attributes(&doc_digest, &signer.der);
     let signature = sign(&attrs)?;
-    let cms_der = cms::build_signed_data(&attrs, &signature, signer);
+    let token = match timestamp {
+        Some(ts) => Some(ts(&cms::signature_value(&signature, signer.alg))?),
+        None => None,
+    };
+    let cms_der = cms::build_signed_data(&attrs, &signature, signer, token.as_deref());
     let hex: String = cms_der.iter().map(|b| format!("{b:02X}")).collect();
     if hex.len() > contents_len {
         bail!(t().err_sig_too_big);
@@ -682,7 +691,7 @@ mod tests {
             visible: Some(Visible { page: 0, rect: [100.0, 100.0, 190.0, 62.0], image }),
         };
         // The CMS is not valid here, which does not matter for the appearance.
-        let signed = sign_pdf(bytes, &req, &signer, &|_| Ok(vec![0u8; 256])).unwrap();
+        let signed = sign_pdf(bytes, &req, &signer, &|_| Ok(vec![0u8; 256]), None).unwrap();
         let found = signature_appearances(&signed).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].signer, "Test Signer");
@@ -749,7 +758,11 @@ mod tests {
         };
         let image = stamp::render(&style, &data, rect[2], rect[3], 4.0);
         let req = SignRequest { signer_name, reason, location, contact, time, visible: Some(Visible { page, rect, image }) };
-        let out = sign_pdf(&bytes, &req, &signer, &|d| crate::certs::sign_data(&thumb, d, signer.alg)).unwrap();
+        // Optional DOC_SIGNER_TSA=<url>: add an RFC 3161 time-stamp (PAdES B-T).
+        let tsa = std::env::var("DOC_SIGNER_TSA").ok();
+        let ts = |v: &[u8]| crate::tsa::timestamp(tsa.as_deref().unwrap(), v).map(|t| t.token);
+        let ts_ref: Option<Timestamper> = if tsa.is_some() { Some(&ts) } else { None };
+        let out = sign_pdf(&bytes, &req, &signer, &|d| crate::certs::sign_data(&thumb, d, signer.alg), ts_ref).unwrap();
         std::fs::write(format!("{input}.signed.pdf"), &out).unwrap();
         assert_eq!(inspect(&out).unwrap().signatures, info.signatures + 1);
     }

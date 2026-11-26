@@ -10,6 +10,8 @@ const OID_ECDSA_SHA256: &str = "1.2.840.10045.4.3.2";
 const OID_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
 const OID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
 const OID_SIGNING_CERT_V2: &str = "1.2.840.113549.1.9.16.2.47";
+const OID_SIGNATURE_TIME_STAMP: &str = "1.2.840.113549.1.9.16.2.14";
+const OID_TST_INFO: &str = "1.2.840.113549.1.9.16.1.4";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAlg {
@@ -107,16 +109,29 @@ fn ecdsa_raw_to_der(raw: &[u8]) -> Vec<u8> {
     seq(&[&uint(r), &uint(s)])
 }
 
-pub fn build_signed_data(signed_attrs: &[u8], signature: &[u8], signer: &SignerCert) -> Vec<u8> {
+/// The SignerInfo `signature` value as it is embedded (ECDSA r||s becomes DER); the RFC 3161
+/// timestamp is taken over exactly these bytes.
+pub fn signature_value(signature: &[u8], alg: KeyAlg) -> Vec<u8> {
+    match alg {
+        KeyAlg::Rsa => signature.to_vec(),
+        KeyAlg::Ecdsa => ecdsa_raw_to_der(signature),
+    }
+}
+
+/// `timestamp_token`: an RFC 3161 TimeStampToken (ContentInfo) added as the unsigned attribute
+/// id-aa-signatureTimeStampToken (CAdES-T / PAdES B-T).
+pub fn build_signed_data(signed_attrs: &[u8], signature: &[u8], signer: &SignerCert, timestamp_token: Option<&[u8]>) -> Vec<u8> {
     let sha256 = seq(&[&oid(OID_SHA256)]);
-    let (sig_alg, sig_value) = match signer.alg {
-        KeyAlg::Rsa => (seq(&[&oid(OID_RSA), &[0x05, 0x00]]), signature.to_vec()),
-        KeyAlg::Ecdsa => (seq(&[&oid(OID_ECDSA_SHA256)]), ecdsa_raw_to_der(signature)),
+    let sig_value = signature_value(signature, signer.alg);
+    let sig_alg = match signer.alg {
+        KeyAlg::Rsa => seq(&[&oid(OID_RSA), &[0x05, 0x00]]),
+        KeyAlg::Ecdsa => seq(&[&oid(OID_ECDSA_SHA256)]),
     };
     let mut attrs_implicit = signed_attrs.to_vec();
     attrs_implicit[0] = 0xA0;
 
     let sid = seq(&[&signer.issuer_der, &uint(&signer.serial_be)]);
+    let unsigned = timestamp_token.map(|tok| tlv(0xA1, &seq(&[&oid(OID_SIGNATURE_TIME_STAMP), &set(&[tok])]))).unwrap_or_default();
     let signer_info = seq(&[
         &uint(&[1]),
         &sid,
@@ -124,6 +139,7 @@ pub fn build_signed_data(signed_attrs: &[u8], signature: &[u8], signer: &SignerC
         &attrs_implicit,
         &sig_alg,
         &octet(&sig_value),
+        &unsigned,
     ]);
     let certs = tlv(0xA0, &signer.chain.concat());
     let signed_data = seq(&[
@@ -136,9 +152,146 @@ pub fn build_signed_data(signed_attrs: &[u8], signature: &[u8], signer: &SignerC
     seq(&[&oid(OID_SIGNED_DATA), &tlv(0xA0, &signed_data)])
 }
 
+// ---------- RFC 3161 time-stamp protocol ----------
+
+/// Splits one DER TLV off the front: (tag, content, remainder).
+pub fn read_tlv(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = b.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (first as usize, rest)
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || rest.len() < n {
+            return None;
+        }
+        (rest[..n].iter().fold(0usize, |acc, &x| acc << 8 | x as usize), &rest[n..])
+    };
+    (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
+}
+
+/// TimeStampReq (v1) for a SHA-256 `digest`, with `nonce` and certReq = TRUE.
+pub fn timestamp_request(digest: &[u8], nonce: &[u8]) -> Vec<u8> {
+    let imprint = seq(&[&seq(&[&oid(OID_SHA256), &[0x05, 0x00]]), &octet(digest)]);
+    seq(&[&uint(&[1]), &imprint, &uint(nonce), &[0x01, 0x01, 0xFF]])
+}
+
+/// Unsigned big-endian magnitude of a DER INTEGER content (leading zero bytes removed).
+fn magnitude(int: &[u8]) -> &[u8] {
+    let skip = int.iter().take_while(|&&b| b == 0).count();
+    &int[skip.min(int.len().saturating_sub(1))..]
+}
+
+/// A verified time-stamp: the token to embed and the TSA's time (GeneralizedTime text).
+#[derive(Debug)]
+pub struct TimeStamp {
+    pub token: Vec<u8>,
+    pub gen_time: String,
+}
+
+/// Checks a TimeStampResp: status granted, token present, and the token's message imprint and
+/// nonce match the request. The TSA's signature over the token is checked by validators.
+pub fn parse_timestamp_response(resp: &[u8], digest: &[u8], nonce: &[u8]) -> Result<TimeStamp, String> {
+    let bad = |what: &str| format!("invalid time-stamp response ({what})");
+    let (_, body, _) = read_tlv(resp).filter(|t| t.0 == 0x30).ok_or_else(|| bad("structure"))?;
+    let (_, status_info, rest) = read_tlv(body).filter(|t| t.0 == 0x30).ok_or_else(|| bad("status"))?;
+    let (_, status, after_status) = read_tlv(status_info).filter(|t| t.0 == 0x02).ok_or_else(|| bad("status"))?;
+    let status = status.iter().fold(0u32, |a, &b| a << 8 | b as u32);
+    if status > 1 {
+        // PKIFreeText (SEQUENCE OF UTF8String) may explain why.
+        let text = read_tlv(after_status)
+            .filter(|t| t.0 == 0x30)
+            .and_then(|(_, s, _)| read_tlv(s))
+            .map(|(_, t, _)| String::from_utf8_lossy(t).into_owned())
+            .unwrap_or_default();
+        return Err(format!("time-stamp request rejected (status {status}) {text}").trim().to_string());
+    }
+    if rest.is_empty() {
+        return Err(bad("no token"));
+    }
+    let token_len = rest.len() - read_tlv(rest).ok_or_else(|| bad("token"))?.2.len();
+    let token = &rest[..token_len];
+
+    // ContentInfo { signedData, [0] SignedData { version, digestAlgs, encapContentInfo { tstInfo, [0] OCTET STRING } } }
+    let (_, ci, _) = read_tlv(token).ok_or_else(|| bad("token"))?;
+    let (_, _, ci) = read_tlv(ci).filter(|t| t.0 == 0x06).ok_or_else(|| bad("token"))?;
+    let (_, sd, _) = read_tlv(ci).filter(|t| t.0 == 0xA0).ok_or_else(|| bad("token"))?;
+    let (_, sd, _) = read_tlv(sd).filter(|t| t.0 == 0x30).ok_or_else(|| bad("token"))?;
+    let (_, _, sd) = read_tlv(sd).ok_or_else(|| bad("token"))?; // version
+    let (_, _, sd) = read_tlv(sd).ok_or_else(|| bad("token"))?; // digestAlgorithms
+    let (_, eci, _) = read_tlv(sd).filter(|t| t.0 == 0x30).ok_or_else(|| bad("token"))?;
+    let (_, ctype, eci) = read_tlv(eci).filter(|t| t.0 == 0x06).ok_or_else(|| bad("token"))?;
+    if oid(OID_TST_INFO)[2..] != *ctype {
+        return Err(bad("content type"));
+    }
+    let (_, econtent, _) = read_tlv(eci).filter(|t| t.0 == 0xA0).ok_or_else(|| bad("token"))?;
+    let (_, tst, _) = read_tlv(econtent).filter(|t| t.0 == 0x04).ok_or_else(|| bad("TSTInfo"))?;
+
+    // TSTInfo { version, policy, messageImprint { alg, hash }, serial, genTime, accuracy?, ordering?, nonce?, ... }
+    let (_, tst, _) = read_tlv(tst).filter(|t| t.0 == 0x30).ok_or_else(|| bad("TSTInfo"))?;
+    let (_, _, tst) = read_tlv(tst).ok_or_else(|| bad("TSTInfo"))?; // version
+    let (_, _, tst) = read_tlv(tst).ok_or_else(|| bad("TSTInfo"))?; // policy
+    let (_, imprint, tst) = read_tlv(tst).filter(|t| t.0 == 0x30).ok_or_else(|| bad("imprint"))?;
+    let (_, _, imprint) = read_tlv(imprint).ok_or_else(|| bad("imprint"))?; // algorithm
+    let (_, hash, _) = read_tlv(imprint).filter(|t| t.0 == 0x04).ok_or_else(|| bad("imprint"))?;
+    if hash != digest {
+        return Err("time-stamp is for a different hash".into());
+    }
+    let (_, _, tst) = read_tlv(tst).ok_or_else(|| bad("serial"))?;
+    let (_, gen_time, mut tst) = read_tlv(tst).filter(|t| t.0 == 0x18).ok_or_else(|| bad("genTime"))?;
+    let mut got_nonce = None;
+    while let Some((tag, v, rest)) = read_tlv(tst) {
+        if tag == 0x02 {
+            got_nonce = Some(v);
+            break;
+        }
+        tst = rest;
+    }
+    if got_nonce.map(magnitude) != Some(magnitude(nonce)) {
+        return Err("time-stamp nonce does not match".into());
+    }
+    Ok(TimeStamp { token: token.to_vec(), gen_time: String::from_utf8_lossy(gen_time).into_owned() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A TimeStampResp as a TSA would send it (unsigned token body; signature checks are the validator's job).
+    fn fake_response(digest: &[u8], nonce: &[u8], status: u8) -> Vec<u8> {
+        let imprint = seq(&[&seq(&[&oid(OID_SHA256)]), &octet(digest)]);
+        let tst = seq(&[&uint(&[1]), &oid("1.2.3.4"), &imprint, &uint(&[7]), &tlv(0x18, b"20261126120000Z"), &uint(nonce)]);
+        let encap = seq(&[&oid(OID_TST_INFO), &tlv(0xA0, &octet(&tst))]);
+        let sd = seq(&[&uint(&[3]), &set(&[&seq(&[&oid(OID_SHA256)])]), &encap, &set(&[])]);
+        let token = seq(&[&oid(OID_SIGNED_DATA), &tlv(0xA0, &sd)]);
+        seq(&[&seq(&[&uint(&[status])]), &token])
+    }
+
+    #[test]
+    fn timestamp_response_is_checked_against_the_request() {
+        let digest = [7u8; 32];
+        let nonce = [0x80, 1, 2, 3];
+        let req = timestamp_request(&digest, &nonce);
+        assert_eq!(req[0], 0x30);
+        assert!(req.windows(32).any(|w| w == digest));
+        let ok = parse_timestamp_response(&fake_response(&digest, &nonce, 0), &digest, &nonce).unwrap();
+        assert_eq!(ok.gen_time, "20261126120000Z");
+        assert_eq!(read_tlv(&ok.token).unwrap().2.len(), 0, "token is exactly one TLV");
+        assert!(parse_timestamp_response(&fake_response(&[8u8; 32], &nonce, 0), &digest, &nonce).is_err(), "wrong hash");
+        assert!(parse_timestamp_response(&fake_response(&digest, &[9], 0), &digest, &nonce).is_err(), "wrong nonce");
+        assert!(parse_timestamp_response(&fake_response(&digest, &nonce, 2), &digest, &nonce).is_err(), "rejected");
+    }
+
+    #[test]
+    fn timestamp_token_becomes_an_unsigned_attribute() {
+        let signer = SignerCert { der: vec![0x30, 0], issuer_der: vec![0x30, 0], serial_be: vec![1], chain: vec![], alg: KeyAlg::Rsa };
+        let token = seq(&[&oid(OID_SIGNED_DATA)]);
+        let with = build_signed_data(&signed_attributes(&[0; 32], b"c"), &[1; 4], &signer, Some(&token));
+        let attr = tlv(0xA1, &seq(&[&oid(OID_SIGNATURE_TIME_STAMP), &set(&[&token])]));
+        assert!(with.windows(attr.len()).any(|w| w == attr.as_slice()));
+        let without = build_signed_data(&signed_attributes(&[0; 32], b"c"), &[1; 4], &signer, None);
+        assert!(!without.windows(2).any(|w| w == [0xA1, attr[1]]));
+    }
 
     #[test]
     fn encodes_oid_and_lengths() {

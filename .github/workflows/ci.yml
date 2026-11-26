@@ -58,6 +58,16 @@ jobs:
       - name: Validate the signed PDF independently
         run: python scripts/validate_signature.py ci-test/test.pdf.signed.pdf ci-test/certs/ci.crt
 
+      # PAdES B-T with a real public TSA (#34).
+      - name: E2E with an RFC 3161 time-stamp
+        env:
+          DOC_SIGNER_TSA: http://timestamp.digicert.com
+        run: |
+          set -euo pipefail
+          cp tests/fixtures/minimal.pdf ci-test/tsa.pdf
+          DOC_SIGNER_TEST_PDF="$GITHUB_WORKSPACE/ci-test/tsa.pdf" cargo test signs_with -- --include-ignored --nocapture
+          python scripts/validate_signature.py ci-test/tsa.pdf.signed.pdf ci-test/certs/ci.crt --expect-timestamp
+
   test-windows:
     runs-on: windows-latest
     steps:

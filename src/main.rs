@@ -11,6 +11,7 @@ mod settings;
 mod stamp;
 mod style;
 mod style_ui;
+mod tsa;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -102,6 +103,9 @@ struct App {
     location: String,
     contact: String,
     visible: bool,
+    /// Add an RFC 3161 time-stamp (PAdES B-T) from `tsa_url`.
+    use_tsa: bool,
+    tsa_url: String,
     styles: style_ui::StyleUi,
     /// Corner being dragged on the page preview and the fixed opposite corner (page points).
     resizing: Option<(usize, egui::Pos2)>,
@@ -130,6 +134,8 @@ impl App {
             location: String::new(),
             contact: String::new(),
             visible: true,
+            use_tsa: settings::get("tsa").as_deref() == Some("1"),
+            tsa_url: settings::get("tsa_url").filter(|u| !u.trim().is_empty()).unwrap_or_else(|| tsa::DEFAULT_URL.into()),
             styles: style_ui::StyleUi::new(),
             resizing: None,
             output: Output::Suffix,
@@ -311,6 +317,7 @@ impl App {
         let (tx, rx) = channel();
         self.job = Some(rx);
         let (reason, location, contact) = (self.reason.clone(), self.location.clone(), self.contact.clone());
+        let tsa_url = self.use_tsa.then(|| self.tsa_url.trim().to_string());
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let signer = certs::load_signer(&cert.thumbprint);
@@ -338,7 +345,9 @@ impl App {
                         time,
                         visible,
                     };
-                    let out = pdf::sign_pdf(&input, &req, signer, &|d| certs::sign_data(&cert.thumbprint, d, signer.alg))?;
+                    let ts = |v: &[u8]| tsa::timestamp(tsa_url.as_deref().unwrap_or(tsa::DEFAULT_URL), v).map(|t| t.token);
+                    let ts_ref: Option<pdf::Timestamper> = if tsa_url.is_some() { Some(&ts) } else { None };
+                    let out = pdf::sign_pdf(&input, &req, signer, &|d| certs::sign_data(&cert.thumbprint, d, signer.alg), ts_ref)?;
                     let tmp = dst.with_extension("pdf.tmp");
                     std::fs::write(&tmp, &out)?;
                     std::fs::rename(&tmp, &dst)?;
@@ -590,6 +599,21 @@ impl App {
                 ui.label(t().contact);
                 ui.add(egui::TextEdit::singleline(&mut self.contact).hint_text(t().contact_hint).desired_width(field_w));
                 ui.end_row();
+            });
+            if ui.checkbox(&mut self.use_tsa, t().tsa_enable).on_hover_text(t().tsa_hint).changed() {
+                settings::set("tsa", if self.use_tsa { "1" } else { "0" });
+            }
+            ui.add_enabled_ui(self.use_tsa, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    let edit = ui.add(egui::TextEdit::singleline(&mut self.tsa_url).hint_text(tsa::DEFAULT_URL).desired_width(ui.available_width()));
+                    if edit.lost_focus() {
+                        if self.tsa_url.trim().is_empty() {
+                            self.tsa_url = tsa::DEFAULT_URL.into();
+                        }
+                        settings::set("tsa_url", self.tsa_url.trim());
+                    }
+                });
             });
 
             ui.separator();
