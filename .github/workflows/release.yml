@@ -73,7 +73,7 @@ jobs:
             tar czf "dist/${{ matrix.asset }}" -C dist doc-signer libpdfium.so
           else
             # bsdtar on Windows writes zip when -a infers the format from the extension
-            cd dist && tar -a -cf "${{ matrix.asset }}" doc-signer.exe pdfium.dll
+            (cd dist && tar -a -cf "${{ matrix.asset }}" doc-signer.exe pdfium.dll)
           fi
           ls -la dist/
 
