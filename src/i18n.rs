@@ -132,6 +132,7 @@ pub struct Tr {
 
     pub pdfium_missing: &'static str,
     pub no_certs: &'static str,
+    #[cfg_attr(windows, allow(dead_code))]
     pub no_certs_hint: &'static str,
     pub certs_error: &'static str,
     pub skipped_not_pdf: &'static str,
