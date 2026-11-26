@@ -3,6 +3,7 @@
 mod certs;
 mod i18n;
 mod cms;
+mod fonts;
 mod pdf;
 mod preview;
 mod stamp;
@@ -132,6 +133,9 @@ impl App {
         };
         if !app.previewer.available() {
             app.push(Level::Info, t().pdfium_missing);
+        }
+        if stamp::uses_builtin_font() {
+            app.push(Level::Info, t().stamp_font_fallback);
         }
         app.reload_certs();
         for arg in std::env::args_os().skip(1) {
@@ -287,7 +291,7 @@ impl App {
                         time: Local::now(),
                         visible,
                     };
-                    let out = pdf::sign_pdf(&input, &req, signer, &|d| certs::sign_digest(&cert.thumbprint, d, signer.alg))?;
+                    let out = pdf::sign_pdf(&input, &req, signer, &|d| certs::sign_data(&cert.thumbprint, d, signer.alg))?;
                     let tmp = dst.with_extension("pdf.tmp");
                     std::fs::write(&tmp, &out)?;
                     std::fs::rename(&tmp, &dst)?;
@@ -802,48 +806,26 @@ impl eframe::App for App {
     }
 }
 
+/// System UI fonts (same lookup as the stamp, see `fonts`); egui's built-in fonts stay as fallback.
 fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let mut add = |name: &str, file: &str, family: egui::FontFamily, first: bool| -> bool {
-        if let Ok(bytes) = std::fs::read(file) {
-            fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(bytes)));
-            let list = fonts.families.entry(family).or_default();
-            if first { list.insert(0, name.into()) } else { list.push(name.into()) }
-            true
-        } else {
-            false
-        }
+    let mut defs = egui::FontDefinitions::default();
+    let mut add = |name: String, bytes: Vec<u8>, family: egui::FontFamily, first: bool| {
+        defs.font_data.insert(name.clone(), Arc::new(egui::FontData::from_owned(bytes)));
+        let list = defs.families.entry(family).or_default();
+        if first { list.insert(0, name) } else { list.push(name) }
     };
-    #[cfg(windows)]
-    {
-        let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
-        add("segoe", &format!("{dir}\\Fonts\\segoeui.ttf"), egui::FontFamily::Proportional, true);
-        add("symbols", &format!("{dir}\\Fonts\\seguisym.ttf"), egui::FontFamily::Proportional, false);
-        add("emoji", &format!("{dir}\\Fonts\\seguiemj.ttf"), egui::FontFamily::Proportional, false);
-        add("consolas", &format!("{dir}\\Fonts\\consola.ttf"), egui::FontFamily::Monospace, true);
+    if let Some(b) = fonts::find(fonts::SYSTEM.regular) {
+        add("system-sans".into(), b, egui::FontFamily::Proportional, true);
     }
-    #[cfg(not(windows))]
-    {
-        // Best-effort system fonts; when none is found egui keeps its built-in font.
-        for file in [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        ] {
-            if add("sans", file, egui::FontFamily::Proportional, true) {
-                break;
-            }
-        }
-        for file in [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
-        ] {
-            if add("mono", file, egui::FontFamily::Monospace, true) {
-                break;
-            }
+    for (i, file) in fonts::SYSTEM.symbols.iter().enumerate() {
+        if let Some(b) = fonts::find(&[file]) {
+            add(format!("system-symbols-{i}"), b, egui::FontFamily::Proportional, false);
         }
     }
-    ctx.set_fonts(fonts);
+    if let Some(b) = fonts::find(fonts::SYSTEM.mono) {
+        add("system-mono".into(), b, egui::FontFamily::Monospace, true);
+    }
+    ctx.set_fonts(defs);
 }
 
 fn open(p: &Path) {
