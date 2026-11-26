@@ -57,7 +57,34 @@ pub enum Shape {
     Rect,
     Rounded { radius: f32 },
     Ellipse,
+    /// Round seal: text along the top and bottom arcs (see [`SealSpec`]).
+    Seal,
     None,
+}
+
+/// Texts of a round seal. Placeholders: `{label}`, `{name}`, `{date}`, `{reason}`, `{location}`,
+/// `{issuer}`, `{contact}`. `{label}` and `{name}` are always present (see `Style::normalize`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct SealSpec {
+    pub top: String,
+    pub bottom: String,
+    #[serde(default = "seal_date_format")]
+    pub date_format: String,
+    #[serde(default = "yes")]
+    pub uppercase: bool,
+    /// ✓ in the centre when the style has no picture.
+    #[serde(default = "yes")]
+    pub check: bool,
+}
+
+fn seal_date_format() -> String {
+    "%d.%m.%Y".into()
+}
+
+impl Default for SealSpec {
+    fn default() -> Self {
+        SealSpec { top: "{label} • {name}".into(), bottom: "{date}".into(), date_format: seal_date_format(), uppercase: true, check: true }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -241,6 +268,8 @@ pub struct Style {
     pub fields: Vec<Field>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<StyleImage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<SealSpec>,
 }
 
 /// Values shown in a stamp.
@@ -276,6 +305,7 @@ fn format_date(time: &DateTime<Local>, format: &str) -> String {
 impl StampData {
     fn expand(&self, template: &str, date: &str) -> String {
         template
+            .replace("{label}", t().stamp_signed_by)
             .replace("{name}", &self.name)
             .replace("{date}", date)
             .replace("{reason}", self.reason.trim())
@@ -315,6 +345,18 @@ impl Style {
         if let Some(s) = &mut self.font.size {
             *s = s.clamp(3.0, 72.0);
         }
+        if self.shape == Shape::Seal {
+            // A seal is round; its arcs must name the real signer.
+            self.size.h = self.size.w;
+            let seal = self.seal.get_or_insert_with(SealSpec::default);
+            let all = format!("{} {}", seal.top, seal.bottom);
+            if !all.contains("{name}") {
+                seal.top = format!("{} • {{name}}", seal.top.trim()).trim_start_matches(" • ").to_string();
+            }
+            if !all.contains("{label}") {
+                seal.top = format!("{{label}} • {}", seal.top.trim()).trim_end_matches(" • ").to_string();
+            }
+        }
         if let Some(img) = &mut self.image {
             img.opacity = img.opacity.clamp(0.05, 1.0);
             if let Some(t) = &mut img.remove_background {
@@ -334,6 +376,17 @@ impl Style {
             img.png_base64 = format!("{}:{:x}", img.png_base64.len(), h.finish());
         }
         to_json(&c)
+    }
+
+    /// Expanded (top, bottom) arc texts of a seal.
+    pub fn seal_texts(&self, d: &StampData) -> Option<(String, String)> {
+        let seal = self.seal.as_ref()?;
+        let date = format_date(&d.time, &seal.date_format);
+        let fix = |s: String| {
+            let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+            if seal.uppercase { s.to_uppercase() } else { s }
+        };
+        Some((fix(d.expand(&seal.top, &date)), fix(d.expand(&seal.bottom, &date))))
     }
 
     /// The text lines of this style for the given values; empty optional fields are skipped.
@@ -387,6 +440,7 @@ fn base(id: &str, name: &str) -> Style {
             Field::new(FieldKind::Contact).off(),
         ],
         image: None,
+        seal: None,
     }
 }
 
@@ -426,7 +480,13 @@ pub fn builtins() -> Vec<Style> {
     ];
     handwritten.image = Some(StyleImage { png_base64: String::new(), position: ImagePosition::Left, opacity: 1.0, remove_background: Some(0.9) });
 
-    let mut v = vec![classic, minimal, badge, corporate, handwritten];
+    let mut seal = base("builtin:seal", tr.seal_style);
+    seal.shape = Shape::Seal;
+    seal.size = Size { w: 110.0, h: 110.0 };
+    seal.border = Border { width: 1.4, style: BorderStyle::Double };
+    seal.seal = Some(SealSpec::default());
+
+    let mut v = vec![classic, minimal, badge, corporate, handwritten, seal];
     for s in &mut v {
         s.normalize();
     }
@@ -568,6 +628,20 @@ mod tests {
         let texts: Vec<String> = s.lines(&data()).into_iter().map(|l| l.text).collect();
         assert!(!texts.iter().any(|t| t.contains("Location") || t.ends_with(": ")));
         assert!(texts.contains(&"Ivan Petrov / Approved".to_string()));
+    }
+
+    #[test]
+    fn seal_always_names_the_signer() {
+        let mut s = builtins().into_iter().find(|s| s.shape == Shape::Seal).unwrap();
+        assert_eq!(s.size.w, s.size.h);
+        s.seal = Some(SealSpec { top: "ACME".into(), bottom: "{date}".into(), ..SealSpec::default() });
+        s.size.h = 50.0;
+        s.normalize();
+        assert_eq!(s.size.h, s.size.w, "seal stays round");
+        let (top, bottom) = s.seal_texts(&data()).unwrap();
+        assert!(top.contains("IVAN PETROV") && top.contains("ACME"), "{top}");
+        assert!(top.contains(&t().stamp_signed_by.to_uppercase()), "{top}");
+        assert_eq!(bottom, "26.11.2026");
     }
 
     #[test]

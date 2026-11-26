@@ -598,7 +598,7 @@ impl StyleUi {
                     ui.label(ts.size);
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut s.size.w).range(40.0..=600.0).speed(1.0).suffix(" ×"));
-                        ui.add(egui::DragValue::new(&mut s.size.h).range(20.0..=400.0).speed(1.0));
+                        ui.add_enabled(s.shape != Shape::Seal, egui::DragValue::new(&mut s.size.h).range(20.0..=400.0).speed(1.0));
                     });
                     ui.end_row();
 
@@ -613,6 +613,7 @@ impl StyleUi {
                             s.shape = Shape::Rounded { radius };
                         }
                         ui.radio_value(&mut s.shape, Shape::Ellipse, ts.shape_ellipse);
+                        ui.radio_value(&mut s.shape, Shape::Seal, ts.shape_seal);
                         ui.radio_value(&mut s.shape, Shape::None, ts.shape_none);
                         if let Shape::Rounded { radius } = &mut s.shape {
                             ui.add(egui::DragValue::new(radius).range(0.0..=60.0).speed(0.2).prefix(format!("{} ", ts.radius)));
@@ -689,7 +690,32 @@ impl StyleUi {
                     ui.end_row();
                 });
 
+                if s.shape == Shape::Seal {
+                    let seal = s.seal.get_or_insert_with(style::SealSpec::default);
+                    ui.separator();
+                    ui.strong(ts.shape_seal);
+                    ui.label(RichText::new(ts.seal_hint).weak().small());
+                    egui::Grid::new("seal-editor").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                        ui.label(ts.top_arc);
+                        ui.add(egui::TextEdit::singleline(&mut seal.top).desired_width(f32::INFINITY));
+                        ui.end_row();
+                        ui.label(ts.bottom_arc);
+                        ui.add(egui::TextEdit::singleline(&mut seal.bottom).desired_width(f32::INFINITY));
+                        ui.end_row();
+                        ui.label(ts.date_format);
+                        ui.add(egui::TextEdit::singleline(&mut seal.date_format).desired_width(140.0));
+                        ui.end_row();
+                    });
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut seal.uppercase, ts.uppercase);
+                        ui.checkbox(&mut seal.check, ts.center_check);
+                    });
+                }
+
                 ui.separator();
+                // The seal uses its arc texts instead of the field list.
+                let fields_ui = s.shape != Shape::Seal;
+                if fields_ui {
                 ui.strong(ts.fields);
                 ui.label(RichText::new(ts.placeholders).weak().small());
                 let mut swap = None;
@@ -757,6 +783,7 @@ impl StyleUi {
                     let mut f = Field::new(FieldKind::Custom);
                     f.text = "{reason}".into();
                     s.fields.push(f);
+                }
                 }
 
                 ui.separator();

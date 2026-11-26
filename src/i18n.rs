@@ -575,6 +575,13 @@ pub static ES: Tr = Tr {
 
 /// Strings of the stamp-style UI.
 pub struct StyleTr {
+    pub shape_seal: &'static str,
+    pub seal_style: &'static str,
+    pub top_arc: &'static str,
+    pub bottom_arc: &'static str,
+    pub center_check: &'static str,
+    pub uppercase: &'static str,
+    pub seal_hint: &'static str,
     pub handwritten: &'static str,
     pub image: &'static str,
     pub from_file: &'static str,
@@ -675,6 +682,13 @@ pub struct StyleTr {
 }
 
 pub static EN_STYLE: StyleTr = StyleTr {
+    shape_seal: "Seal",
+    seal_style: "Round seal",
+    top_arc: "top arc",
+    bottom_arc: "bottom arc",
+    center_check: "✓ in the centre (without a picture)",
+    uppercase: "uppercase",
+    seal_hint: "Placeholders: {label} {name} {date} {reason} {location} {issuer} {contact}. {label} and {name} are always on the seal; a picture goes in the centre.",
     handwritten: "Handwritten",
     image: "Image",
     from_file: "From file…",
@@ -775,6 +789,13 @@ pub static EN_STYLE: StyleTr = StyleTr {
 };
 
 pub static BG_STYLE: StyleTr = StyleTr {
+    shape_seal: "Печат",
+    seal_style: "Кръгъл печат",
+    top_arc: "горна дъга",
+    bottom_arc: "долна дъга",
+    center_check: "✓ в центъра (без изображение)",
+    uppercase: "главни букви",
+    seal_hint: "Заместители: {label} {name} {date} {reason} {location} {issuer} {contact}. {label} и {name} винаги са на печата; изображението е в центъра.",
     handwritten: "Ръкописен",
     image: "Изображение",
     from_file: "От файл…",
@@ -875,6 +896,13 @@ pub static BG_STYLE: StyleTr = StyleTr {
 };
 
 pub static DE_STYLE: StyleTr = StyleTr {
+    shape_seal: "Siegel",
+    seal_style: "Rundes Siegel",
+    top_arc: "oberer Bogen",
+    bottom_arc: "unterer Bogen",
+    center_check: "✓ in der Mitte (ohne Bild)",
+    uppercase: "Großbuchstaben",
+    seal_hint: "Platzhalter: {label} {name} {date} {reason} {location} {issuer} {contact}. {label} und {name} stehen immer auf dem Siegel; ein Bild kommt in die Mitte.",
     handwritten: "Handschriftlich",
     image: "Bild",
     from_file: "Aus Datei…",
@@ -975,6 +1003,13 @@ pub static DE_STYLE: StyleTr = StyleTr {
 };
 
 pub static ES_STYLE: StyleTr = StyleTr {
+    shape_seal: "Sello",
+    seal_style: "Sello redondo",
+    top_arc: "arco superior",
+    bottom_arc: "arco inferior",
+    center_check: "✓ en el centro (sin imagen)",
+    uppercase: "mayúsculas",
+    seal_hint: "Marcadores: {label} {name} {date} {reason} {location} {issuer} {contact}. {label} y {name} siempre están en el sello; la imagen va en el centro.",
     handwritten: "Manuscrita",
     image: "Imagen",
     from_file: "Desde archivo…",
