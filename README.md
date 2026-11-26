@@ -15,6 +15,7 @@ Prebuilt binaries (built from `master` by GitHub Actions) are on the [Releases p
 - Choose a personal certificate with a private key. Certificates with the document-signing extended key usage are sorted to the top and marked with ★.
 - The signature is PAdES (`ETSI.CAdES.detached`, SHA-256) and is added as an *incremental update*, so existing signatures stay valid.
 - Optional visible stamp (name, date, reason, location — Cyrillic included). Position it by clicking or dragging on the page preview; by default it is placed at the bottom-right of the last page.
+- **Stamp styles**: pick a style in the gallery (Classic, Minimal, Badge, Corporate) or create your own with *Edit…* — shape (rectangle, rounded, ellipse, no border), colours, border (single/double/dashed), font, and which fields are shown in which order (with `{name}`, `{date}`, `{reason}`, `{location}`, `{issuer}`, `{contact}` placeholders). The "Digitally signed by" label and the signer's name are always shown. Styles are stored in `%APPDATA%\DocSigner\styles` (Linux: `~/.config/DocSigner/styles`) and can be shared with *⋯ → Export / Import* (`.json`); a style saved as *locked* can only be duplicated. See [docs/design/stamp-appearance.md](docs/design/stamp-appearance.md).
 - The result is a new file with a suffix (default ` - signed`) or an overwrite of the original.
 
 ## Certificates
