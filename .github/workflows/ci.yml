@@ -105,3 +105,19 @@ jobs:
 
       - name: Validate the signed PDF independently
         run: python scripts/validate_signature.py ci-test/test.pdf.signed.pdf ci-test/ci.cer
+
+      # Legacy CryptoAPI (CSP) key: the CryptSignHash path (#33).
+      - name: E2E with a legacy CSP key
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate -Subject "CN=Doc Signer CI CSP, O=Acme" `
+            -CertStoreLocation Cert:\CurrentUser\My -KeyAlgorithm RSA -KeyLength 2048 -HashAlgorithm SHA256 `
+            -Provider "Microsoft Enhanced RSA and AES Cryptographic Provider" -KeySpec Signature `
+            -NotAfter (Get-Date).AddDays(30)
+          Export-Certificate -Cert $cert -FilePath ci-test/csp.cer | Out-Null
+          Copy-Item tests/fixtures/minimal.pdf ci-test/csp.pdf
+          $env:DOC_SIGNER_TEST_PDF = "$PWD\ci-test\csp.pdf"
+          $env:DOC_SIGNER_THUMB = $cert.Thumbprint
+          cargo test --release signs_with -- --include-ignored --nocapture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python scripts/validate_signature.py ci-test/csp.pdf.signed.pdf ci-test/csp.cer

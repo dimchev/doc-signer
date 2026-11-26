@@ -152,7 +152,29 @@ pub fn load_signer(thumbprint: &[u8]) -> Result<SignerCert> {
     }
 }
 
+/// RSA PKCS#1 v1.5 signature of a SHA-256 `digest` with a legacy CryptoAPI (CSP) key.
+unsafe fn sign_csp(prov: usize, spec: CERT_KEY_SPEC, digest: &[u8]) -> Result<Vec<u8>> {
+    unsafe {
+        let mut hash = 0usize;
+        // Fails for providers without SHA-256 (e.g. PROV_RSA_FULL "Base"/"Enhanced" CSPs).
+        CryptCreateHash(prov, CALG_SHA_256, 0, 0, &mut hash).map_err(|e| anyhow!("{}: {e}", t().err_csp_sha256))?;
+        let result = CryptSetHashParam(hash, HP_HASHVAL, digest.as_ptr(), 0).and_then(|_| {
+            let mut len = 0u32;
+            CryptSignHashW(hash, spec.0, None, 0, None, &mut len)?;
+            let mut sig = vec![0u8; len as usize];
+            CryptSignHashW(hash, spec.0, None, 0, Some(sig.as_mut_ptr()), &mut len)?;
+            sig.truncate(len as usize);
+            // CryptoAPI returns the signature little-endian.
+            sig.reverse();
+            Ok(sig)
+        });
+        let _ = CryptDestroyHash(hash);
+        result.map_err(|e| anyhow!("{}: {e}", t().err_sign_refused))
+    }
+}
+
 /// Signs the SHA-256 of `data` with the certificate's private key (may show a PIN prompt for smart cards).
+/// CNG keys use NCrypt (RSA or ECDSA); legacy CryptoAPI (CSP) keys use CryptSignHash (RSA only).
 pub fn sign_data(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>> {
     let digest = sha2::Sha256::digest(data);
     let store = Store::open_my()?;
@@ -163,7 +185,7 @@ pub fn sign_data(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>>
         let mut must_free = windows::core::BOOL(0);
         CryptAcquireCertificatePrivateKey(
             cert.0,
-            CRYPT_ACQUIRE_ONLY_NCRYPT_KEY_FLAG,
+            CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG,
             None,
             &mut key,
             Some(&mut spec),
@@ -171,7 +193,12 @@ pub fn sign_data(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>>
         )
         .context(t().err_no_key)?;
         if spec != CERT_NCRYPT_KEY_SPEC {
-            bail!(t().err_not_cng);
+            let prov = key.0;
+            let result = if alg == KeyAlg::Rsa { sign_csp(prov, spec, &digest) } else { Err(anyhow!("{}", t().err_not_cng)) };
+            if must_free.as_bool() {
+                let _ = CryptReleaseContext(prov, 0);
+            }
+            return result;
         }
         let hkey = NCRYPT_KEY_HANDLE(key.0);
 
