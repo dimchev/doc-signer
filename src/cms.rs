@@ -9,7 +9,7 @@ const OID_RSA: &str = "1.2.840.113549.1.1.1";
 const OID_ECDSA_SHA256: &str = "1.2.840.10045.4.3.2";
 const OID_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
 const OID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
-const OID_SIGNING_CERT_V2: &str = "1.2.840.113549.1.9.16";
+const OID_SIGNING_CERT_V2: &str = "1.2.840.113549.1.9.16.2.47";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAlg {
@@ -89,10 +89,11 @@ pub fn signed_attributes(content_digest: &[u8], cert_der: &[u8]) -> Vec<u8> {
     let content_type = seq(&[&oid(OID_CONTENT_TYPE), &set(&[&oid(OID_DATA)])]);
     let message_digest = seq(&[&oid(OID_MESSAGE_DIGEST), &set(&[&octet(content_digest)])]);
     let cert_hash = Sha256::digest(cert_der);
-    // ESSCertIDv2 (RFC 8419): SEQUENCE { certificateHash OCTET STRING };
-    // certType is optional and omitted for the default SHA-256.
+    // RFC 5035: SigningCertificateV2 ::= SEQUENCE { certs SEQUENCE OF ESSCertIDv2, policies OPTIONAL }
+    // ESSCertIDv2 ::= SEQUENCE { hashAlgorithm DEFAULT sha256 (omitted), certHash OCTET STRING, ... }
     let ess_cert_id = seq(&[&octet(&cert_hash)]);
-    let signing_cert_attr = seq(&[&oid(OID_SIGNING_CERT_V2), &set(&[&ess_cert_id])]);
+    let signing_cert = seq(&[&seq(&[&ess_cert_id])]);
+    let signing_cert_attr = seq(&[&oid(OID_SIGNING_CERT_V2), &set(&[&signing_cert])]);
 
     let mut attrs = vec![content_type, message_digest, signing_cert_attr];
     attrs.sort();
@@ -151,5 +152,16 @@ mod tests {
         assert_eq!(uint(&[0x80]), [2, 2, 0, 0x80]);
         assert_eq!(uint(&[0, 0, 0x7f]), [2, 1, 0x7f]);
         assert_eq!(uint(&[0, 0x80]), [2, 2, 0, 0x80]);
+    }
+
+    /// PAdES B-B requires the signing-certificate-v2 attribute with the RFC 5035 structure.
+    #[test]
+    fn signing_certificate_v2_attribute_is_rfc5035() {
+        let cert = b"fake certificate der";
+        let attrs = signed_attributes(&[0u8; 32], cert);
+        let hash = Sha256::digest(cert);
+        let ess_cert_id = seq(&[&octet(&hash)]);
+        let expected = seq(&[&oid("1.2.840.113549.1.9.16.2.47"), &set(&[&seq(&[&seq(&[&ess_cert_id])])])]);
+        assert!(attrs.windows(expected.len()).any(|w| w == expected.as_slice()), "signing-certificate-v2 attribute missing or malformed");
     }
 }
