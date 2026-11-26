@@ -1,11 +1,12 @@
 """Independent validation of PDFs signed by doc-signer (used by CI).
 
-Usage: python scripts/validate_signature.py <signed.pdf> <trust-root.(pem|der|cer|crt)> [--expect-timestamp]
+Usage: python scripts/validate_signature.py <signed.pdf> <trust-root.(pem|der|cer|crt)> [--expect-timestamp] [--password <pw>]
 
 Fails (exit code 1) unless every signature is intact, cryptographically valid,
 chains to the given trust root and carries the signed attributes PAdES B-B needs.
 The last signature must also cover the entire file. With --expect-timestamp every signature
 must carry an intact, valid RFC 3161 signature time-stamp (PAdES B-T).
+Encrypted PDFs are decrypted with --password (default: the empty user password).
 """
 
 import sys
@@ -26,11 +27,15 @@ REQUIRED_ATTRS = {
 }
 
 
-def main(pdf_path: str, trust_path: str, expect_timestamp: bool = False) -> int:
+def main(pdf_path: str, trust_path: str, expect_timestamp: bool = False, password: str = "") -> int:
     vc = ValidationContext(trust_roots=[load_cert_from_pemder(trust_path)])
     errors = []
     with open(pdf_path, "rb") as f:
-        sigs = PdfFileReader(f, strict=False).embedded_signatures
+        reader = PdfFileReader(f, strict=False)
+        if reader.encrypted:
+            reader.decrypt(password)
+            print("decrypted:", reader.security_handler.__class__.__name__)
+        sigs = reader.embedded_signatures
         if not sigs:
             print("FAIL: no signatures found")
             return 1
@@ -64,8 +69,14 @@ def main(pdf_path: str, trust_path: str, expect_timestamp: bool = False) -> int:
 
 
 if __name__ == "__main__":
-    args = [a for a in sys.argv[1:] if a != "--expect-timestamp"]
+    argv = sys.argv[1:]
+    pw = ""
+    if "--password" in argv:
+        i = argv.index("--password")
+        pw = argv[i + 1]
+        del argv[i : i + 2]
+    args = [a for a in argv if a != "--expect-timestamp"]
     if len(args) != 2:
         print(__doc__)
         sys.exit(2)
-    sys.exit(main(args[0], args[1], "--expect-timestamp" in sys.argv))
+    sys.exit(main(args[0], args[1], "--expect-timestamp" in argv, pw))
