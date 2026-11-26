@@ -1,21 +1,22 @@
 # Doc Signer
 
-A small desktop application (Rust + egui) for digitally signing PDF documents — without Adobe. Runs on **Windows** and **Linux**.
+A small desktop application (Rust + egui) for digitally signing PDF documents - without Adobe. Runs on **Windows** and **Linux**.
 
 ## Downloads
 
 Prebuilt binaries (built from `master` by GitHub Actions) are on the [Releases page](https://github.com/dimchev/doc-signer/releases):
 
-- **Windows x64** — `doc-signer-windows-x64.zip`: unzip and run `doc-signer.exe` (`pdfium.dll` is included for the page preview).
-- **Linux x64** — `doc-signer-linux-x64.tar.gz`: extract and run `./doc-signer` (`libpdfium.so` is included for the page preview). Built on Ubuntu 22.04, so it needs **glibc ≥ 2.35**, **OpenSSL 3** (`libssl3`), **GTK 3** and **X11** — e.g. Ubuntu 22.04+, Debian 12+, Fedora 36+, current Arch (`sudo apt install libgtk-3-0 libx11-6 libssl3`). On older distributions, build from source.
+- **Windows x64** - `doc-signer-windows-x64.zip`: unzip and run `doc-signer.exe` (`pdfium.dll` is included for the page preview).
+- **Linux x64** - `doc-signer-linux-x64.tar.gz`: extract and run `./doc-signer` (`libpdfium.so` is included for the page preview). Built on Ubuntu 22.04, so it needs **glibc ≥ 2.35**, **OpenSSL 3** (`libssl3`), **GTK 3** and **X11** - e.g. Ubuntu 22.04+, Debian 12+, Fedora 36+, current Arch (`sudo apt install libgtk-3-0 libx11-6 libssl3`). On older distributions, build from source.
 
 ## Features
 
 - Sign one or many PDF files (button, `Ctrl+O`, drag & drop of files or a folder, or command-line arguments).
+- **Any other file** (docx, xlsx, odt, images, zip, …) is signed as a whole with a CAdES signature: **`.p7s`** (separate signature file, the original stays unchanged) or **`.p7m`** (the file embedded in the signature). Verify e.g. with `openssl cms -verify -binary -inform DER -in file.docx.p7s -content file.docx -CAfile <root>` or the EU DSS validator.
 - Choose a personal certificate with a private key. Certificates with the document-signing extended key usage are sorted to the top and marked with ★.
 - The signature is PAdES (`ETSI.CAdES.detached`, SHA-256) and is added as an *incremental update*, so existing signatures stay valid.
-- Optional visible stamp (name, date, reason, location — Cyrillic included). Position it by clicking or dragging on the page preview and **resize it by dragging a corner** (Shift keeps the proportions); by default it is placed at the bottom-right of the last page. Each document can use its own style (🎨 on the document card).
-- **Stamp styles**: pick a style in the gallery (Classic, Minimal, Badge, Corporate, Handwritten, Round seal) or create your own with *Edit…* — shape (rectangle, rounded, ellipse, **round seal** with text along the arcs, no border), colours, border (single/double/dashed), font, an **image** (handwritten signature, logo or company seal — from PNG / JPG / SVG / PDF, drawn in the app, or **taken from a signature in an already signed PDF** (e.g. made with Adobe, B-Trust, Evrotrust or pyHanko — needs pdfium); white backgrounds of scans are removed automatically; placed left, right, on top or behind the text), and which fields are shown in which order (with `{name}`, `{date}`, `{reason}`, `{location}`, `{issuer}`, `{contact}` placeholders). The "Digitally signed by" label and the signer's name are always shown. Styles are stored in `%APPDATA%\DocSigner\styles` (Linux: `~/.config/DocSigner/styles`) and can be shared with *⋯ → Export / Import* (`.json`); a style saved as *locked* can only be duplicated. See [docs/design/stamp-appearance.md](docs/design/stamp-appearance.md).
+- Optional visible stamp (name, date, reason, location - Cyrillic included). Position it by clicking or dragging on the page preview and **resize it by dragging a corner** (Shift keeps the proportions); by default it is placed at the bottom-right of the last page. Each document can use its own style (🎨 on the document card).
+- **Stamp styles**: pick a style in the gallery (Classic, Minimal, Badge, Corporate, Handwritten, Round seal) or create your own with *Edit…* - shape (rectangle, rounded, ellipse, **round seal** with text along the arcs, no border), colours, border (single/double/dashed), font, an **image** (handwritten signature, logo or company seal - from PNG / JPG / SVG / PDF, drawn in the app, or **taken from a signature in an already signed PDF** (e.g. made with Adobe, B-Trust, Evrotrust or pyHanko - needs pdfium); white backgrounds of scans are removed automatically; placed left, right, on top or behind the text), and which fields are shown in which order (with `{name}`, `{date}`, `{reason}`, `{location}`, `{issuer}`, `{contact}` placeholders). The "Digitally signed by" label and the signer's name are always shown. Styles are stored in `%APPDATA%\DocSigner\styles` (Linux: `~/.config/DocSigner/styles`) and can be shared with *⋯ → Export / Import* (`.json`); a style saved as *locked* can only be duplicated. See [docs/design/stamp-appearance.md](docs/design/stamp-appearance.md).
 - Optional **trusted timestamp** (RFC 3161, PAdES B-T): the signing time comes from a time-stamp authority (default `http://timestamp.digicert.com`, configurable) instead of the PC clock. Only a hash of the signature is sent. If the TSA cannot be reached, signing fails rather than silently producing a signature without the timestamp.
 - The result is a new file with a suffix (default ` - signed`) or an overwrite of the original.
 
@@ -23,7 +24,7 @@ Prebuilt binaries (built from `master` by GitHub Actions) are on the [Releases p
 
 ### Windows
 
-Certificates are read from the personal store (`CurrentUser\My`). The private key is used through Windows CNG, or the legacy CryptoAPI (CSP) for older smart-card middleware (RSA with a provider that supports SHA-256) — for smart cards, Windows itself shows the PIN prompt.
+Certificates are read from the personal store (`CurrentUser\My`). The private key is used through Windows CNG, or the legacy CryptoAPI (CSP) for older smart-card middleware (RSA with a provider that supports SHA-256) - for smart cards, Windows itself shows the PIN prompt.
 
 ### Linux
 
@@ -35,8 +36,8 @@ Certificates are read as files from the first folder that exists:
 
 Supported file formats:
 
-- **PKCS#12** (`.p12`, `.pfx`) — certificate + key (+ optional chain) in one file. The passphrase is taken from the `DOC_SIGNER_PASS` environment variable, or from a `.pass` file next to the PKCS#12 file (first line).
-- **X.509 + private key** — a `.crt`, `.cer`, `.der` or `.pem` certificate plus the matching private key in a file next to it (e.g. `signer.crt` + `signer.key`, or `signer.pem` + `signer.key.pem`).
+- **PKCS#12** (`.p12`, `.pfx`) - certificate + key (+ optional chain) in one file. The passphrase is taken from the `DOC_SIGNER_PASS` environment variable, or from a `.pass` file next to the PKCS#12 file (first line).
+- **X.509 + private key** - a `.crt`, `.cer`, `.der` or `.pem` certificate plus the matching private key in a file next to it (e.g. `signer.crt` + `signer.key`, or `signer.pem` + `signer.key.pem`).
 
 Passphrases:
 
@@ -110,10 +111,10 @@ CI does this on Linux (OpenSSL key from a file) and on Windows (a throwaway CNG 
 
 ## Third-party
 
-- [pdfium](https://github.com/bblanchon/pdfium) (Apache License 2.0) — optional, for page preview.
-- [lopdf](https://github.com/lopdf/lopdf) — PDF parsing.
-- [egui / eframe](https://github.com/emilk/egui) — GUI.
-- [openssl](https://github.com/rust-openssl/openssl) (Linux) — certificate and key handling.
+- [pdfium](https://github.com/bblanchon/pdfium) (Apache License 2.0) - optional, for page preview.
+- [lopdf](https://github.com/lopdf/lopdf) - PDF parsing.
+- [egui / eframe](https://github.com/emilk/egui) - GUI.
+- [openssl](https://github.com/rust-openssl/openssl) (Linux) - certificate and key handling.
 
 ## License
 

@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod cades;
 mod certs;
 mod i18n;
 mod image_src;
@@ -65,6 +66,10 @@ struct Doc {
     size: Option<Vec2>,
     /// Style id for this document only; `None` = the selected style.
     style: Option<String>,
+    /// PDF (PAdES, visible stamp) or any other file (CAdES `.p7s` / `.p7m`).
+    pdf: bool,
+    /// File size in bytes (shown for non-PDF files).
+    bytes: u64,
 }
 
 impl Doc {
@@ -106,6 +111,8 @@ struct App {
     /// Add an RFC 3161 time-stamp (PAdES B-T) from `tsa_url`.
     use_tsa: bool,
     tsa_url: String,
+    /// Signature format for non-PDF files.
+    cades_format: cades::Format,
     styles: style_ui::StyleUi,
     /// Corner being dragged on the page preview and the fixed opposite corner (page points).
     resizing: Option<(usize, egui::Pos2)>,
@@ -136,6 +143,7 @@ impl App {
             visible: true,
             use_tsa: settings::get("tsa").as_deref() == Some("1"),
             tsa_url: settings::get("tsa_url").filter(|u| !u.trim().is_empty()).unwrap_or_else(|| tsa::DEFAULT_URL.into()),
+            cades_format: cades::Format::from_code(settings::get("cades").as_deref().unwrap_or("p7s")),
             styles: style_ui::StyleUi::new(),
             resizing: None,
             output: Output::Suffix,
@@ -216,19 +224,23 @@ impl App {
 
     fn add_file(&mut self, path: PathBuf) {
         let is_pdf = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf"));
-        if !is_pdf {
-            self.push(Level::Err, format!("{}: {}", t().skipped_not_pdf, path.display()));
-            return;
-        }
         if self.docs.iter().any(|d| d.path == path) {
             return;
         }
-        let info = std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| pdf::inspect(&b).map_err(|e| format!("{e:#}")));
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let info = if is_pdf {
+            std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| pdf::inspect(&b).map_err(|e| format!("{e:#}")))
+        } else {
+            // Any other file is signed as a whole (CAdES); one placeholder page keeps the PDF-only code paths safe.
+            std::fs::File::open(&path)
+                .map(|_| PdfInfo { pages: vec![pdf::PageGeom { crop: [0.0, 0.0, 595.0, 842.0], rotate: 0 }], signatures: 0 })
+                .map_err(|e| e.to_string())
+        };
         if let Err(e) = &info {
             self.push(Level::Err, format!("{}: {e}", path.display()));
         }
         let checked = info.is_ok();
-        self.docs.push(Doc { path, info, checked, status: Status::Ready, placement: None, size: None, style: None });
+        self.docs.push(Doc { path, info, checked, status: Status::Ready, placement: None, size: None, style: None, pdf: is_pdf, bytes });
         if self.selected.is_none() {
             self.select(self.docs.len() - 1);
         }
@@ -267,11 +279,26 @@ impl App {
     }
 
     fn pick_files(&mut self) {
-        if let Some(files) = rfd::FileDialog::new().add_filter(t().pdf_filter, &["pdf"]).set_title(t().pick_title).pick_files() {
+        let dialog = rfd::FileDialog::new().add_filter(t().pdf_filter, &["pdf"]).add_filter(t().all_files, &["*"]).set_title(t().pick_title);
+        if let Some(files) = dialog.pick_files() {
             for f in files {
                 self.add_file(f);
             }
         }
+    }
+
+    /// `file.ext.p7s` / `file.ext.p7m` next to a non-PDF file (never overwriting an existing one).
+    fn cades_output_path(&self, src: &Path) -> PathBuf {
+        let ext = self.cades_format.extension();
+        let name = src.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let dir = src.parent().unwrap_or(Path::new("."));
+        let mut p = dir.join(format!("{name}.{ext}"));
+        let mut n = 2;
+        while p.exists() {
+            p = dir.join(format!("{name} ({n}).{ext}"));
+            n += 1;
+        }
+        p
     }
 
     fn output_path(&self, src: &Path) -> PathBuf {
@@ -291,19 +318,21 @@ impl App {
 
     fn start_signing(&mut self, ctx: &egui::Context) {
         let Some(cert) = self.current_cert().cloned() else { return };
-        let tasks: Vec<(usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>, style::Style)> = self
+        let cades_format = self.cades_format;
+        let tasks: Vec<(usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>, style::Style, bool)> = self
             .docs
             .iter()
             .enumerate()
             .filter(|(_, d)| d.checked && d.info.is_ok())
             .map(|(i, d)| {
-                let visible = if self.visible {
+                let visible = if self.visible && d.pdf {
                     let size = self.doc_size(d);
                     self.placement_for(d).map(|p| (p.page, [p.x, p.y, size.x, size.y]))
                 } else {
                     None
                 };
-                (i, d.path.clone(), self.output_path(&d.path), visible, self.doc_style(d).clone())
+                let dst = if d.pdf { self.output_path(&d.path) } else { self.cades_output_path(&d.path) };
+                (i, d.path.clone(), dst, visible, self.doc_style(d).clone(), d.pdf)
             })
             .collect();
         if tasks.is_empty() {
@@ -321,10 +350,20 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let signer = certs::load_signer(&cert.thumbprint);
-            for (idx, src, dst, visible, stamp_style) in tasks {
+            for (idx, src, dst, visible, stamp_style, is_pdf) in tasks {
                 let result = (|| -> anyhow::Result<PathBuf> {
                     let signer = signer.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
                     let input = std::fs::read(&src)?;
+                    let ts = |v: &[u8]| tsa::timestamp(tsa_url.as_deref().unwrap_or(tsa::DEFAULT_URL), v).map(|t| t.token);
+                    let ts_ref: Option<pdf::Timestamper> = if tsa_url.is_some() { Some(&ts) } else { None };
+                    let sign = |d: &[u8]| certs::sign_data(&cert.thumbprint, d, signer.alg);
+                    let tmp = PathBuf::from(format!("{}.tmp", dst.display()));
+                    if !is_pdf {
+                        let out = cades::sign(&input, cades_format, signer, &sign, ts_ref)?;
+                        std::fs::write(&tmp, &out)?;
+                        std::fs::rename(&tmp, &dst)?;
+                        return Ok(dst);
+                    }
                     let time = Local::now();
                     let visible = visible.map(|(page, rect)| {
                         let data = style::StampData {
@@ -345,10 +384,7 @@ impl App {
                         time,
                         visible,
                     };
-                    let ts = |v: &[u8]| tsa::timestamp(tsa_url.as_deref().unwrap_or(tsa::DEFAULT_URL), v).map(|t| t.token);
-                    let ts_ref: Option<pdf::Timestamper> = if tsa_url.is_some() { Some(&ts) } else { None };
-                    let out = pdf::sign_pdf(&input, &req, signer, &|d| certs::sign_data(&cert.thumbprint, d, signer.alg), ts_ref)?;
-                    let tmp = dst.with_extension("pdf.tmp");
+                    let out = pdf::sign_pdf(&input, &req, signer, &sign, ts_ref)?;
                     std::fs::write(&tmp, &out)?;
                     std::fs::rename(&tmp, &dst)?;
                     Ok(dst)
@@ -459,6 +495,7 @@ impl App {
                             if ui.add_enabled(!busy, egui::Button::new("✖").small()).on_hover_text(t().remove_tip).clicked() {
                                 remove = Some(i);
                             }
+                            if doc.pdf {
                             ui.menu_button("🎨", |ui| {
                                 ui.label(RichText::new(t().style.doc_style).strong());
                                 if ui.radio(doc.style.is_none(), t().style.use_selected).clicked() {
@@ -476,6 +513,7 @@ impl App {
                             })
                             .response
                             .on_hover_text(t().style.doc_style);
+                            }
                             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                 let name = ui.add(egui::Label::new(RichText::new(doc.name()).strong()).truncate().sense(Sense::click()));
                                 if name.clicked() {
@@ -488,6 +526,10 @@ impl App {
                     let detail = match (&doc.info, &doc.status) {
                         (Err(e), _) => RichText::new(e).color(Color32::from_rgb(210, 60, 60)).small(),
                         (_, Status::Failed(e)) => RichText::new(e).color(Color32::from_rgb(210, 60, 60)).small(),
+                        (Ok(_), _) if !doc.pdf => {
+                            let ext = self.cades_format.extension();
+                            RichText::new(t().other_file.replace("{size}", &human_size(doc.bytes)).replace("{ext}", ext)).weak().small()
+                        }
                         (Ok(info), _) => {
                             let mut s = t().pages.replace("{n}", &info.pages.len().to_string());
                             if info.signatures > 0 {
@@ -658,6 +700,16 @@ impl App {
                 });
             });
             ui.radio_value(&mut self.output, Output::Overwrite, t().output_overwrite);
+            if self.docs.iter().any(|d| !d.pdf) {
+                ui.add_space(4.0);
+                ui.label(RichText::new(t().other_files).strong());
+                let before = self.cades_format;
+                ui.radio_value(&mut self.cades_format, cades::Format::Detached, t().p7s_label);
+                ui.radio_value(&mut self.cades_format, cades::Format::Enveloping, t().p7m_label);
+                if self.cades_format != before {
+                    settings::set("cades", self.cades_format.code());
+                }
+            }
             ui.checkbox(&mut self.open_folder_after, t().open_folder);
 
             ui.add_space(12.0);
@@ -708,6 +760,11 @@ impl App {
                 return;
             }
         };
+        if !self.docs[sel].pdf {
+            let msg = t().no_preview_other.replace("{ext}", self.cades_format.extension());
+            ui.centered_and_justified(|ui| ui.label(RichText::new(format!("📦\n\n{}\n\n{msg}", self.docs[sel].name())).weak().size(15.0)));
+            return;
+        }
         let n = info.pages.len();
         self.page = self.page.min(n - 1);
 
@@ -981,6 +1038,14 @@ fn reveal(p: &Path) {
     {
         let dir = p.parent().unwrap_or_else(|| Path::new("."));
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+fn human_size(b: u64) -> String {
+    match b {
+        b if b >= 1 << 20 => format!("{:.1} MB", b as f64 / (1u64 << 20) as f64),
+        b if b >= 1 << 10 => format!("{:.0} KB", b as f64 / 1024.0),
+        b => format!("{b} B"),
     }
 }
 

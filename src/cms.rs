@@ -10,6 +10,7 @@ const OID_ECDSA_SHA256: &str = "1.2.840.10045.4.3.2";
 const OID_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
 const OID_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
 const OID_SIGNING_CERT_V2: &str = "1.2.840.113549.1.9.16.2.47";
+const OID_SIGNING_TIME: &str = "1.2.840.113549.1.9.5";
 const OID_SIGNATURE_TIME_STAMP: &str = "1.2.840.113549.1.9.16.2.14";
 const OID_TST_INFO: &str = "1.2.840.113549.1.9.16.1.4";
 
@@ -87,7 +88,23 @@ fn oid(s: &str) -> Vec<u8> {
 }
 
 /// DER `SET OF Attribute` for signed attributes; this exact encoding is what gets signed.
+/// PAdES forbids the signing-time attribute (the time is in the signature dictionary).
 pub fn signed_attributes(content_digest: &[u8], cert_der: &[u8]) -> Vec<u8> {
+    signed_attributes_at(content_digest, cert_der, None)
+}
+
+/// RFC 5652 Time: UTCTime for 1950–2049, GeneralizedTime otherwise.
+fn der_time(t: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    use chrono::Datelike;
+    if (1950..2050).contains(&t.year()) {
+        tlv(0x17, t.format("%y%m%d%H%M%SZ").to_string().as_bytes())
+    } else {
+        tlv(0x18, t.format("%Y%m%d%H%M%SZ").to_string().as_bytes())
+    }
+}
+
+/// Signed attributes with an optional signing-time (CAdES-B requires it).
+pub fn signed_attributes_at(content_digest: &[u8], cert_der: &[u8], signing_time: Option<chrono::DateTime<chrono::Utc>>) -> Vec<u8> {
     let content_type = seq(&[&oid(OID_CONTENT_TYPE), &set(&[&oid(OID_DATA)])]);
     let message_digest = seq(&[&oid(OID_MESSAGE_DIGEST), &set(&[&octet(content_digest)])]);
     let cert_hash = Sha256::digest(cert_der);
@@ -98,6 +115,9 @@ pub fn signed_attributes(content_digest: &[u8], cert_der: &[u8]) -> Vec<u8> {
     let signing_cert_attr = seq(&[&oid(OID_SIGNING_CERT_V2), &set(&[&signing_cert])]);
 
     let mut attrs = vec![content_type, message_digest, signing_cert_attr];
+    if let Some(t) = signing_time {
+        attrs.push(seq(&[&oid(OID_SIGNING_TIME), &set(&[&der_time(t)])]));
+    }
     attrs.sort();
     let refs: Vec<&[u8]> = attrs.iter().map(|a| a.as_slice()).collect();
     set(&refs)
@@ -121,6 +141,11 @@ pub fn signature_value(signature: &[u8], alg: KeyAlg) -> Vec<u8> {
 /// `timestamp_token`: an RFC 3161 TimeStampToken (ContentInfo) added as the unsigned attribute
 /// id-aa-signatureTimeStampToken (CAdES-T / PAdES B-T).
 pub fn build_signed_data(signed_attrs: &[u8], signature: &[u8], signer: &SignerCert, timestamp_token: Option<&[u8]>) -> Vec<u8> {
+    build_signed_data_with(signed_attrs, signature, signer, timestamp_token, None)
+}
+
+/// `content`: embed the signed data (enveloping, `.p7m`); `None` = detached.
+pub fn build_signed_data_with(signed_attrs: &[u8], signature: &[u8], signer: &SignerCert, timestamp_token: Option<&[u8]>, content: Option<&[u8]>) -> Vec<u8> {
     let sha256 = seq(&[&oid(OID_SHA256)]);
     let sig_value = signature_value(signature, signer.alg);
     let sig_alg = match signer.alg {
@@ -145,7 +170,10 @@ pub fn build_signed_data(signed_attrs: &[u8], signature: &[u8], signer: &SignerC
     let signed_data = seq(&[
         &uint(&[1]),
         &set(&[&sha256]),
-        &seq(&[&oid(OID_DATA)]),
+        &match content {
+            Some(c) => seq(&[&oid(OID_DATA), &tlv(0xA0, &octet(c))]),
+            None => seq(&[&oid(OID_DATA)]),
+        },
         &certs,
         &set(&[&signer_info]),
     ]);

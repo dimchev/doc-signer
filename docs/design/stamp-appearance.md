@@ -155,7 +155,7 @@ The default style goes into `settings.txt` as `style=<id>`.
 | 2 | Images: from file (PNG/JPG/SVG/PDF), background removal, trimming, positions; drawing pad; style 5 | A scanned signature on a white background ends up transparent |
 | 3 | Round seal: text along an arc, centre image or ✓; style 4 | Text does not overlap at any length (auto-fit to the arc) |
 | 4 | From signed PDF (list of signatures, rendering the appearance alone) | Works with PDFs signed by Adobe, B-Trust and this app |
-| 5 | Resize handles on the page; style per document; i18n EN/BG/DE/ES for everything | — |
+| 5 | Resize handles on the page; style per document; i18n EN/BG/DE/ES for everything | - |
 
 ## 6. Risks
 
