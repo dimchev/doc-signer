@@ -19,11 +19,13 @@ jobs:
             pdfium-tgz: pdfium-linux-x64.tgz
             pdfium-lib: libpdfium.so
             app-ext: ""
+            asset: doc-signer-linux-x64.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             pdfium-tgz: pdfium-win-x64.tgz
             pdfium-lib: pdfium.dll
             app-ext: ".exe"
+            asset: doc-signer-windows-x64.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -68,16 +70,15 @@ jobs:
           cp "$APP" dist/
           cp "$LIB" dist/
           if [ "${{ runner.os }}" = "Linux" ]; then
-            tar czf "dist/doc-signer-linux-x64.tar.gz" -C dist doc-signer libpdfium.so
+            tar czf "dist/${{ matrix.asset }}" -C dist doc-signer libpdfium.so
           else
-            cd dist && zip -q doc-signer-windows-x64.zip doc-signer.exe pdfium.dll
+            # bsdtar on Windows writes zip when -a infers the format from the extension
+            cd dist && tar -a -cf "${{ matrix.asset }}" doc-signer.exe pdfium.dll
           fi
           ls -la dist/
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/doc-signer-*.tar.gz
-            dist/doc-signer-*.zip
+          files: dist/${{ matrix.asset }}
           fail_on_unmatched_files: true
