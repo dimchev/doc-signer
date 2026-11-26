@@ -2,6 +2,7 @@
 
 mod certs;
 mod i18n;
+mod image_src;
 mod cms;
 mod fonts;
 mod pdf;
@@ -831,7 +832,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.preview_panel(ui, ctx));
 
         let data = self.stamp_data();
-        self.styles.windows(ctx, &data);
+        self.styles.windows(ctx, &data, &self.previewer);
         for note in self.styles.take_notes() {
             match note {
                 style_ui::Note::Ok(m) => self.push(Level::Ok, m),
