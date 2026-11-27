@@ -218,26 +218,32 @@ pub fn certificates(content_info: &[u8]) -> Vec<Vec<u8>> {
     signed_data_parts(content_info).map(|(c, _)| c.into_iter().map(<[u8]>::to_vec).collect()).unwrap_or_default()
 }
 
+/// RFC 3161 tokens in an unsigned-attributes list (content of `[1]`).
+pub fn timestamp_tokens_in(mut attrs: &[u8]) -> Vec<Vec<u8>> {
+    let ts_oid = oid(OID_SIGNATURE_TIME_STAMP);
+    let mut out = Vec::new();
+    while let Some((_, attr, more_attrs)) = read_tlv(attrs) {
+        if let Some((_, values, _)) = attr.starts_with(&ts_oid).then(|| read_tlv(&attr[ts_oid.len()..])).flatten() {
+            let mut values = values;
+            while let Some(token) = tlv_bytes(values) {
+                out.push(token.to_vec());
+                values = &values[token.len()..];
+            }
+        }
+        attrs = more_attrs;
+    }
+    out
+}
+
 /// RFC 3161 tokens in the unsigned attributes of every SignerInfo.
 pub fn timestamp_tokens(content_info: &[u8]) -> Vec<Vec<u8>> {
-    let ts_oid = oid(OID_SIGNATURE_TIME_STAMP);
     let mut out = Vec::new();
     let Some((_, mut infos)) = signed_data_parts(content_info) else { return out };
     while let Some((_, info, more)) = read_tlv(infos) {
         let mut fields = info;
         while let Some((tag, v, next)) = read_tlv(fields) {
             if tag == 0xA1 {
-                let mut attrs = v;
-                while let Some((_, attr, more_attrs)) = read_tlv(attrs) {
-                    if let Some((_, values, _)) = tlv_bytes(attr).filter(|a| a.starts_with(&ts_oid)).and_then(|_| read_tlv(&attr[ts_oid.len()..])) {
-                        let mut values = values;
-                        while let Some(token) = tlv_bytes(values) {
-                            out.push(token.to_vec());
-                            values = &values[token.len()..];
-                        }
-                    }
-                    attrs = more_attrs;
-                }
+                out.extend(timestamp_tokens_in(v));
             }
             fields = next;
         }
@@ -285,11 +291,10 @@ fn magnitude(int: &[u8]) -> &[u8] {
     &int[skip.min(int.len().saturating_sub(1))..]
 }
 
-/// A verified time-stamp: the token to embed and the TSA's time (GeneralizedTime text).
+/// A checked time-stamp response: the token to embed.
 #[derive(Debug)]
 pub struct TimeStamp {
     pub token: Vec<u8>,
-    pub gen_time: String,
 }
 
 /// Checks a TimeStampResp: status granted, token present, and the token's message imprint and
@@ -341,7 +346,7 @@ pub fn parse_timestamp_response(resp: &[u8], digest: &[u8], nonce: &[u8]) -> Res
         return Err("time-stamp is for a different hash".into());
     }
     let (_, _, tst) = read_tlv(tst).ok_or_else(|| bad("serial"))?;
-    let (_, gen_time, mut tst) = read_tlv(tst).filter(|t| t.0 == 0x18).ok_or_else(|| bad("genTime"))?;
+    let (_, _gen_time, mut tst) = read_tlv(tst).filter(|t| t.0 == 0x18).ok_or_else(|| bad("genTime"))?;
     let mut got_nonce = None;
     while let Some((tag, v, rest)) = read_tlv(tst) {
         if tag == 0x02 {
@@ -353,7 +358,7 @@ pub fn parse_timestamp_response(resp: &[u8], digest: &[u8], nonce: &[u8]) -> Res
     if got_nonce.map(magnitude) != Some(magnitude(nonce)) {
         return Err("time-stamp nonce does not match".into());
     }
-    Ok(TimeStamp { token: token.to_vec(), gen_time: String::from_utf8_lossy(gen_time).into_owned() })
+    Ok(TimeStamp { token: token.to_vec() })
 }
 
 #[cfg(test)]
@@ -378,7 +383,6 @@ mod tests {
         assert_eq!(req[0], 0x30);
         assert!(req.windows(32).any(|w| w == digest));
         let ok = parse_timestamp_response(&fake_response(&digest, &nonce, 0), &digest, &nonce).unwrap();
-        assert_eq!(ok.gen_time, "20261126120000Z");
         assert_eq!(read_tlv(&ok.token).unwrap().2.len(), 0, "token is exactly one TLV");
         assert!(parse_timestamp_response(&fake_response(&[8u8; 32], &nonce, 0), &digest, &nonce).is_err(), "wrong hash");
         assert!(parse_timestamp_response(&fake_response(&digest, &[9], 0), &digest, &nonce).is_err(), "wrong nonce");

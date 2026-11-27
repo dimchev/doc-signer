@@ -531,6 +531,248 @@ pub fn add_dss(input: &[u8], password: Option<&str>, certs: &[Vec<u8>], ocsps: &
     Ok(write_update(input, &doc, &objects, &mut next_id, encrypt)?.0)
 }
 
+/// A signature or document time-stamp found in a PDF.
+pub struct PdfSig {
+    pub field: String,
+    pub doc_timestamp: bool,
+    pub sub_filter: String,
+    pub byte_range: Vec<i64>,
+    /// DER of /Contents without the zero padding.
+    pub contents: Vec<u8>,
+    pub time: Option<DateTime<chrono::Utc>>,
+    pub reason: String,
+    pub location: String,
+}
+
+impl PdfSig {
+    /// End of the signed byte ranges (the file size when the signature was made).
+    pub fn covered_end(&self) -> usize {
+        match self.byte_range[..] {
+            [_, _, b, c] => (b + c).max(0) as usize,
+            _ => 0,
+        }
+    }
+}
+
+/// Signatures and document time-stamps (oldest first) and the DSS certificates.
+pub struct PdfSignatures {
+    pub sigs: Vec<PdfSig>,
+    pub has_dss: bool,
+    pub dss_certs: Vec<Vec<u8>>,
+}
+
+/// PDF date `D:YYYYMMDDHHmmSS+hh'mm'` (missing parts default) in UTC.
+pub fn parse_pdf_date(s: &[u8]) -> Option<DateTime<chrono::Utc>> {
+    let s = std::str::from_utf8(s).ok()?.trim().trim_start_matches("D:");
+    let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 4 {
+        return None;
+    }
+    let field = |from: usize, len: usize, default: u32| digits.get(from..from + len).and_then(|v| v.parse().ok()).unwrap_or(default);
+    let naive = chrono::NaiveDate::from_ymd_opt(field(0, 4, 0) as i32, field(4, 2, 1), field(6, 2, 1))?.and_hms_opt(field(8, 2, 0), field(10, 2, 0), field(12, 2, 0))?;
+    let rest = &s[digits.len()..];
+    let offset = match rest.chars().next() {
+        Some(sign @ ('+' | '-')) => {
+            let tz: String = rest[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+            let mins = tz.get(0..2).and_then(|v| v.parse::<i32>().ok()).unwrap_or(0) * 60 + tz.get(2..4).and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+            if sign == '-' { -mins } else { mins }
+        }
+        _ => 0,
+    };
+    Some((naive - chrono::Duration::minutes(offset as i64)).and_utc())
+}
+
+pub fn signatures(bytes: &[u8], password: Option<&str>) -> Result<PdfSignatures> {
+    let doc = load(bytes, password)?;
+    let mut sigs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for field in doc.objects.values().filter_map(|o| o.as_dict().ok()).filter(|d| is_sig_field(d)) {
+        let Ok(v) = field.get(b"V") else { continue };
+        let Ok((id, sig)) = doc.dereference(v) else { continue };
+        let Ok(sig) = sig.as_dict() else { continue };
+        if id.is_some_and(|id| !seen.insert(id)) {
+            continue;
+        }
+        let name = |k: &[u8]| sig.get(k).ok().and_then(|o| o.as_name().ok()).map(|n| String::from_utf8_lossy(n).into_owned()).unwrap_or_default();
+        let text_of = |k: &[u8]| sig.get(k).ok().and_then(|o| o.as_str().ok()).map(pdf_text).unwrap_or_default();
+        let Some(contents) = sig.get(b"Contents").ok().and_then(|o| o.as_str().ok()) else { continue };
+        sigs.push(PdfSig {
+            field: field.get(b"T").ok().and_then(|o| o.as_str().ok()).map(pdf_text).unwrap_or_default(),
+            doc_timestamp: name(b"Type") == "DocTimeStamp" || name(b"SubFilter") == "ETSI.RFC3161",
+            sub_filter: name(b"SubFilter"),
+            byte_range: resolve_array(&doc, sig.get(b"ByteRange").ok()).iter().filter_map(|o| o.as_i64().ok()).collect(),
+            contents: cms::tlv_bytes(contents).map(<[u8]>::to_vec).unwrap_or_else(|| contents.to_vec()),
+            time: sig.get(b"M").ok().and_then(|o| o.as_str().ok()).and_then(parse_pdf_date),
+            reason: text_of(b"Reason"),
+            location: text_of(b"Location"),
+        });
+    }
+    sigs.sort_by_key(|s| s.covered_end());
+    let catalog = doc.catalog().ok();
+    let dss = catalog.and_then(|c| c.get(b"DSS").ok()).and_then(|o| doc.dereference(o).ok()).and_then(|(_, o)| o.as_dict().ok());
+    let dss_certs = dss
+        .map(|d| resolve_array(&doc, d.get(b"Certs").ok()))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|o| doc.dereference(o).ok())
+        .filter_map(|(_, o)| o.as_stream().ok())
+        .filter_map(|s| s.decompressed_content().ok().or_else(|| Some(s.content.clone())))
+        .collect();
+    Ok(PdfSignatures { sigs, has_dss: dss.is_some(), dss_certs })
+}
+
+/// What happened in the file after the revision that ends at `end`.
+#[derive(Debug, Default, PartialEq)]
+pub struct Changes {
+    pub signatures: usize,
+    pub timestamps: usize,
+    pub validation_data: bool,
+    /// Other changed or added objects, described for the user.
+    pub other: Vec<String>,
+}
+
+fn refs_in(o: &Object, out: &mut Vec<ObjectId>) {
+    match o {
+        Object::Reference(r) => out.push(*r),
+        Object::Array(a) => a.iter().for_each(|v| refs_in(v, out)),
+        Object::Dictionary(d) => d.iter().for_each(|(_, v)| refs_in(v, out)),
+        Object::Stream(s) => s.dict.iter().for_each(|(_, v)| refs_in(v, out)),
+        _ => {}
+    }
+}
+
+fn without(d: &Dictionary, keys: &[&[u8]]) -> Dictionary {
+    let mut d = d.clone();
+    for k in keys {
+        d.remove(k);
+    }
+    d
+}
+
+/// Compares the revision ending at `end` with the whole file and classifies the differences:
+/// new signature fields with their appearance, /DSS validation data and the catalog, AcroForm
+/// and page entries that reference them are expected; everything else is reported.
+pub fn changes_after(bytes: &[u8], end: usize, password: Option<&str>) -> Result<Changes> {
+    let old = load(bytes.get(..end).ok_or_else(|| anyhow!("{}: /ByteRange", t().err_pdf_structure))?, password)?;
+    let new = load(bytes, password)?;
+    let differs = |id: &ObjectId| old.objects.get(id) != new.objects.get(id);
+    let touched: BTreeSet<ObjectId> = new.objects.keys().filter(|id| differs(id)).copied().collect();
+    let mut ok: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut ch = Changes::default();
+
+    // Everything new reachable from these roots is part of the allowed addition.
+    let allow_from = |start: Vec<ObjectId>, ok: &mut BTreeSet<ObjectId>| {
+        let mut stack = start;
+        while let Some(id) = stack.pop() {
+            if !touched.contains(&id) || !ok.insert(id) {
+                continue;
+            }
+            if let Some(o) = new.objects.get(&id) {
+                refs_in(o, &mut stack);
+            }
+        }
+    };
+    let mut new_widgets = BTreeSet::new();
+    for id in &touched {
+        let Some(o) = new.objects.get(id) else { continue };
+        let dict = match o {
+            Object::Dictionary(d) => d,
+            Object::Stream(s) => &s.dict,
+            _ => continue,
+        };
+        let ty = dict.get(b"Type").ok().and_then(|o| o.as_name().ok()).unwrap_or_default();
+        if old.objects.contains_key(id) {
+            continue;
+        }
+        if ty == b"XRef" || ty == b"ObjStm" {
+            ok.insert(*id);
+        } else if ty == b"Sig" {
+            ch.signatures += 1;
+            ok.insert(*id);
+        } else if ty == b"DocTimeStamp" {
+            ch.timestamps += 1;
+            ok.insert(*id);
+        } else if is_sig_field(dict) {
+            new_widgets.insert(*id);
+            let mut refs = Vec::new();
+            refs_in(o, &mut refs);
+            ok.insert(*id);
+            allow_from(refs, &mut ok);
+        }
+    }
+    let root_id = new.trailer.get(b"Root").and_then(|o| o.as_reference()).ok();
+    if let Some(root_id) = root_id {
+        if let Ok(cat) = new.get_dictionary(root_id) {
+            if let Ok(Object::Reference(dss)) = cat.get(b"DSS") {
+                ch.validation_data = touched.contains(dss);
+                allow_from(vec![*dss], &mut ok);
+            } else if cat.get(b"DSS").is_ok() {
+                let mut refs = Vec::new();
+                refs_in(cat.get(b"DSS").unwrap(), &mut refs);
+                ch.validation_data = refs.iter().any(|r| touched.contains(r));
+                allow_from(refs, &mut ok);
+            }
+        }
+    }
+    // Only references to the new signature fields may be added to /Fields and /Annots.
+    let only_new_widgets = |o: Option<&Object>, n: Option<&Object>| {
+        let old_items = resolve_array(&old, o);
+        let new_items = resolve_array(&new, n);
+        new_items.len() >= old_items.len()
+            && new_items[..old_items.len()] == old_items[..]
+            && new_items[old_items.len()..].iter().all(|r| matches!(r, Object::Reference(id) if new_widgets.contains(id)))
+    };
+    let form_ok = |a: &Dictionary, b: &Dictionary| {
+        without(a, &[b"Fields", b"SigFlags"]) == without(b, &[b"Fields", b"SigFlags"]) && only_new_widgets(a.get(b"Fields").ok(), b.get(b"Fields").ok())
+    };
+    for id in &touched {
+        if ok.contains(id) {
+            continue;
+        }
+        let (Some(Object::Dictionary(a)), Some(Object::Dictionary(b))) = (old.objects.get(id), new.objects.get(id)) else {
+            ch.other.push(describe(&new, *id));
+            continue;
+        };
+        let allowed = if Some(*id) == root_id {
+            let keys: [&[u8]; 3] = [b"DSS", b"AcroForm", b"Extensions"];
+            let form = match (a.get(b"AcroForm"), b.get(b"AcroForm")) {
+                (Ok(Object::Dictionary(fa)), Ok(Object::Dictionary(fb))) => form_ok(fa, fb),
+                (Err(_), Ok(Object::Dictionary(fb))) => form_ok(&Dictionary::new(), fb),
+                (x, y) => x.ok() == y.ok(),
+            };
+            without(a, &keys) == without(b, &keys) && form
+        } else if a.get(b"Fields").is_ok() || b.get(b"Fields").is_ok() {
+            form_ok(a, b)
+        } else if a.get(b"Type").ok().and_then(|o| o.as_name().ok()) == Some(b"Page") {
+            without(a, &[b"Annots"]) == without(b, &[b"Annots"]) && only_new_widgets(a.get(b"Annots").ok(), b.get(b"Annots").ok())
+        } else {
+            false
+        };
+        if !allowed {
+            ch.other.push(describe(&new, *id));
+        }
+    }
+    Ok(ch)
+}
+
+fn describe(doc: &Document, id: ObjectId) -> String {
+    let dict = match doc.objects.get(&id) {
+        Some(Object::Dictionary(d)) => Some(d),
+        Some(Object::Stream(s)) => Some(&s.dict),
+        _ => None,
+    };
+    let name = |k: &[u8]| dict.and_then(|d| d.get(k).ok()).and_then(|o| o.as_name().ok()).map(|n| String::from_utf8_lossy(n).into_owned());
+    let what = match (name(b"Type"), name(b"Subtype"), dict.is_some_and(|d| d.get(b"FT").is_ok())) {
+        (_, _, true) => "form field".to_string(),
+        (Some(t), Some(s), _) => format!("{t}/{s}"),
+        (Some(t), None, _) => t,
+        (None, Some(s), _) => s,
+        _ if matches!(doc.objects.get(&id), Some(Object::Stream(_))) => "stream".into(),
+        _ => "object".into(),
+    };
+    format!("{what} {} {}", id.0, id.1)
+}
+
 /// Encrypts `o` with the key of object `id` when the document is encrypted, then serializes it.
 fn seal(crypt: Option<&lopdf::EncryptionState>, id: ObjectId, mut o: Object) -> Result<Vec<u8>> {
     if let Some(state) = crypt {
@@ -847,6 +1089,17 @@ fn add_signature(input: &[u8], password: Option<&str>, kind: Kind) -> Result<Vec
 }
 
 #[cfg(test)]
+pub(crate) mod tests_support {
+    pub fn startxref(b: &[u8]) -> usize {
+        super::startxref(b).unwrap()
+    }
+
+    pub fn obj_bytes(o: &lopdf::Object) -> Vec<u8> {
+        super::obj_bytes(o)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1059,5 +1312,13 @@ mod tests {
         std::fs::write(format!("{input}.signed.pdf"), &out).unwrap();
         let doc_timestamps = usize::from(std::env::var("DOC_SIGNER_LTA").is_ok());
         assert_eq!(inspect(&out, password.as_deref()).unwrap().signatures, info.signatures + 1 + doc_timestamps);
+        // The app's own verifier must accept what it just wrote (trust depends on the machine).
+        for r in crate::verify::verify_pdf(&out, password.as_deref()).unwrap() {
+            eprintln!("verify {} [{}]", r.title, r.level);
+            for l in &r.checks {
+                eprintln!("  {:?} {}", l.status, l.text);
+            }
+            assert!(r.checks.iter().all(|l| l.status != crate::verify::Status::Fail), "{:?}", r.checks);
+        }
     }
 }

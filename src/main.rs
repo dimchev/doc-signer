@@ -15,6 +15,7 @@ mod stamp;
 mod style;
 mod style_ui;
 mod tsa;
+mod verify;
 mod x509;
 
 use std::path::{Path, PathBuf};
@@ -139,6 +140,10 @@ struct App {
     job: Option<Receiver<JobMsg>>,
     /// Open password prompt: document index, typed password, last error.
     password_prompt: Option<(usize, String, Option<String>)>,
+    /// Signature verification running in the background (file name, result channel).
+    verify_job: Option<(String, Receiver<Result<Vec<verify::Report>, String>>)>,
+    /// Shown verification result (file name, reports or error).
+    verify_result: Option<(String, Result<Vec<verify::Report>, String>)>,
 }
 
 impl App {
@@ -170,6 +175,8 @@ impl App {
             page_tex: None,
             job: None,
             password_prompt: None,
+            verify_job: None,
+            verify_result: None,
         };
         if !app.previewer.available() {
             app.push(Level::Info, t().pdfium_missing);
@@ -541,6 +548,8 @@ impl App {
         let mut remove = None;
         let mut select = None;
         let mut unlock = None;
+        let mut verify_req: Option<(PathBuf, Option<String>)> = None;
+        let verifying = self.verify_job.is_some();
         let busy = self.job.is_some();
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, doc) in self.docs.iter_mut().enumerate() {
@@ -620,6 +629,10 @@ impl App {
                     if doc.locked.is_some() && ui.add_enabled(!busy, egui::Button::new(t().enter_password).small()).clicked() {
                         unlock = Some(i);
                     }
+                    let can_verify = matches!(&doc.info, Ok(info) if doc.pdf && info.signatures > 0) || verify::is_signature_file(&doc.path);
+                    if can_verify && ui.add_enabled(!verifying, egui::Button::new(t().verify.verify_btn).small()).on_hover_text(t().verify.verify_tip).clicked() {
+                        verify_req = Some((doc.path.clone(), doc.password.clone()));
+                    }
                     if let Status::Signed(p) = &doc.status {
                         ui.horizontal(|ui| {
                             ui.add(egui::Label::new(RichText::new(format!("→ {}", p.file_name().unwrap_or_default().to_string_lossy())).small().color(Color32::from_rgb(40, 170, 80))).truncate());
@@ -630,6 +643,9 @@ impl App {
                             }
                             if ui.small_button(t().reveal).clicked() {
                                 reveal(p);
+                            }
+                            if ui.add_enabled(!verifying, egui::Button::new(t().verify.verify_btn).small()).on_hover_text(t().verify.verify_tip).clicked() {
+                                verify_req = Some((p.clone(), doc.password.clone()));
                             }
                         });
                     }
@@ -642,6 +658,9 @@ impl App {
         if let Some(i) = unlock {
             self.password_prompt = Some((i, String::new(), None));
         }
+        if let Some((path, password)) = verify_req {
+            self.start_verify(path, password, ui.ctx());
+        }
         if let Some(i) = remove {
             self.docs.remove(i);
             self.page_tex = None;
@@ -653,6 +672,111 @@ impl App {
             if let Some(s) = self.selected {
                 self.select(s);
             }
+        }
+    }
+
+    fn start_verify(&mut self, path: PathBuf, password: Option<String>, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        self.verify_job = Some((name, rx));
+        self.verify_result = None;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(verify::verify_file(&path, password.as_deref()).map_err(|e| format!("{e:#}")));
+            ctx.request_repaint();
+        });
+    }
+
+    fn verify_window(&mut self, ctx: &egui::Context) {
+        let v = &t().verify;
+        let received = self.verify_job.as_ref().and_then(|(name, rx)| rx.try_recv().ok().map(|r| (name.clone(), r)));
+        if let Some((name, result)) = received {
+            match &result {
+                Ok(reports) => {
+                    let worst = reports.iter().map(|r| r.status()).max().unwrap_or(verify::Status::Ok);
+                    let (level, summary) = match worst {
+                        verify::Status::Ok => (Level::Ok, v.summary_ok),
+                        verify::Status::Warn => (Level::Warn, v.summary_warn),
+                        verify::Status::Fail => (Level::Err, v.summary_fail),
+                    };
+                    self.push(level, format!("{name}: {summary} ({})", reports.len()));
+                }
+                Err(e) => self.push(Level::Err, format!("{name}: {e}")),
+            }
+            self.verify_result = Some((name, result));
+            self.verify_job = None;
+        }
+        let color = |s: verify::Status| match s {
+            verify::Status::Ok => ("✔", Color32::from_rgb(40, 170, 80)),
+            verify::Status::Warn => ("⚠", Color32::from_rgb(220, 150, 0)),
+            verify::Status::Fail => ("✖", Color32::from_rgb(210, 60, 60)),
+        };
+        let title = match (&self.verify_job, &self.verify_result) {
+            (Some((name, _)), _) | (_, Some((name, _))) => v.window_title.replace("{name}", name),
+            _ => return,
+        };
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new(title).id(egui::Id::unique("verify-window")).open(&mut open).collapsible(false).resizable(true).default_width(620.0).default_height(480.0).show(ctx, |ui| {
+            match &self.verify_result {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(v.verifying);
+                    });
+                }
+                Some((_, Err(e))) => {
+                    ui.colored_label(Color32::from_rgb(210, 60, 60), e.as_str());
+                }
+                Some((_, Ok(reports))) => {
+                    egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(560.0).show(ui, |ui| {
+                        for r in reports {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                let (icon, c) = color(r.status());
+                                let summary = match r.status() {
+                                    verify::Status::Ok => v.summary_ok,
+                                    verify::Status::Warn => v.summary_warn,
+                                    verify::Status::Fail => v.summary_fail,
+                                };
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(icon).color(c).size(18.0));
+                                    ui.label(RichText::new(&r.title).strong().size(16.0));
+                                    ui.label(RichText::new(summary).color(c).strong());
+                                    if !r.level.is_empty() {
+                                        ui.label(RichText::new(format!("{}: {}", v.level, r.level)).weak());
+                                    }
+                                });
+                                egui::Grid::new(ui.scope_id().with(&r.title)).num_columns(2).spacing([12.0, 2.0]).show(ui, |ui| {
+                                    for (k, val) in &r.facts {
+                                        ui.label(RichText::new(k).weak());
+                                        ui.add(egui::Label::new(val.as_str()).wrap());
+                                        ui.end_row();
+                                    }
+                                });
+                                ui.add_space(4.0);
+                                for l in &r.checks {
+                                    let (icon, c) = color(l.status);
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new(icon).color(c));
+                                        ui.label(&l.text);
+                                    });
+                                }
+                            });
+                            ui.add_space(6.0);
+                        }
+                    });
+                    ui.label(RichText::new(v.revocation_note).weak().small());
+                }
+            }
+            ui.add_space(4.0);
+            if ui.button(v.close).clicked() {
+                close = true;
+            }
+        });
+        if !open || close {
+            self.verify_result = None;
+            self.verify_job = None;
         }
     }
 
@@ -1145,6 +1269,7 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| self.preview_panel(ui, ctx));
 
         self.password_window(ctx);
+        self.verify_window(ctx);
         let data = self.stamp_data();
         self.styles.windows(ctx, &data, &self.previewer);
         for note in self.styles.take_notes() {
