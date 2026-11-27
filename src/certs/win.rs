@@ -79,6 +79,22 @@ unsafe fn has_private_key(ctx: *const CERT_CONTEXT) -> bool {
     unsafe { CertGetCertificateContextProperty(ctx, CERT_KEY_PROV_INFO_PROP_ID, None, &mut size).is_ok() }
 }
 
+/// Certificates of the trusted root store (CurrentUser\Root, which includes the machine's roots).
+pub fn root_store_certs() -> Vec<Vec<u8>> {
+    let Ok(h) = (unsafe { CertOpenSystemStoreW(None, w!("ROOT")) }) else { return Vec::new() };
+    let store = Store(h);
+    let mut out = Vec::new();
+    let mut ctx: *mut CERT_CONTEXT = null_mut();
+    loop {
+        ctx = unsafe { CertEnumCertificatesInStore(store.0, if ctx.is_null() { None } else { Some(ctx) }) };
+        if ctx.is_null() {
+            break;
+        }
+        out.push(unsafe { encoded(ctx) });
+    }
+    out
+}
+
 /// Personal certificates (CurrentUser\My) that have a private key.
 pub fn list_certificates() -> Result<Vec<crate::CertInfo>> {
     let store = Store::open_my()?;

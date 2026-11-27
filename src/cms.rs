@@ -45,7 +45,7 @@ pub fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
     v
 }
 
-fn seq(parts: &[&[u8]]) -> Vec<u8> {
+pub(crate) fn seq(parts: &[&[u8]]) -> Vec<u8> {
     tlv(0x30, &parts.concat())
 }
 
@@ -53,12 +53,12 @@ fn set(parts: &[&[u8]]) -> Vec<u8> {
     tlv(0x31, &parts.concat())
 }
 
-fn octet(b: &[u8]) -> Vec<u8> {
+pub(crate) fn octet(b: &[u8]) -> Vec<u8> {
     tlv(0x04, b)
 }
 
 /// Unsigned big-endian magnitude -> DER INTEGER.
-fn uint(be: &[u8]) -> Vec<u8> {
+pub(crate) fn uint(be: &[u8]) -> Vec<u8> {
     let mut b: &[u8] = be;
     while b.len() > 1 && b[0] == 0 && b[1] < 0x80 {
         b = &b[1..];
@@ -71,7 +71,7 @@ fn uint(be: &[u8]) -> Vec<u8> {
     tlv(0x02, &c)
 }
 
-fn oid(s: &str) -> Vec<u8> {
+pub(crate) fn oid(s: &str) -> Vec<u8> {
     let arcs: Vec<u64> = s.split('.').map(|a| a.parse().unwrap()).collect();
     let mut out = vec![(arcs[0] * 40 + arcs[1]) as u8];
     for &a in &arcs[2..] {
@@ -178,6 +178,81 @@ pub fn build_signed_data_with(signed_attrs: &[u8], signature: &[u8], signer: &Si
         &set(&[&signer_info]),
     ]);
     seq(&[&oid(OID_SIGNED_DATA), &tlv(0xA0, &signed_data)])
+}
+
+// ---------- reading SignedData ----------
+
+/// The whole TLV (tag, length and content) at the front of `b`.
+pub fn tlv_bytes(b: &[u8]) -> Option<&[u8]> {
+    let (_, _, rest) = read_tlv(b)?;
+    Some(&b[..b.len() - rest.len()])
+}
+
+/// Certificates and the SignerInfos SET content of a ContentInfo(SignedData).
+fn signed_data_parts(content_info: &[u8]) -> Option<(Vec<&[u8]>, &[u8])> {
+    let (_, ci, _) = read_tlv(content_info).filter(|t| t.0 == 0x30)?;
+    let (_, _, ci) = read_tlv(ci).filter(|t| t.0 == 0x06)?;
+    let (_, sd, _) = read_tlv(ci).filter(|t| t.0 == 0xA0)?;
+    let (_, sd, _) = read_tlv(sd).filter(|t| t.0 == 0x30)?;
+    let (_, _, r) = read_tlv(sd)?; // version
+    let (_, _, r) = read_tlv(r)?; // digestAlgorithms
+    let (_, _, mut r) = read_tlv(r)?; // encapContentInfo
+    let mut certs = Vec::new();
+    if r.first() == Some(&0xA0) {
+        let (_, mut list, rest) = read_tlv(r)?;
+        while let Some(c) = tlv_bytes(list) {
+            certs.push(c);
+            list = &list[c.len()..];
+        }
+        r = rest;
+    }
+    if r.first() == Some(&0xA1) {
+        r = read_tlv(r)?.2; // crls
+    }
+    let (_, signer_infos, _) = read_tlv(r).filter(|t| t.0 == 0x31)?;
+    Some((certs, signer_infos))
+}
+
+/// Certificates embedded in a CMS ContentInfo(SignedData).
+pub fn certificates(content_info: &[u8]) -> Vec<Vec<u8>> {
+    signed_data_parts(content_info).map(|(c, _)| c.into_iter().map(<[u8]>::to_vec).collect()).unwrap_or_default()
+}
+
+/// RFC 3161 tokens in the unsigned attributes of every SignerInfo.
+pub fn timestamp_tokens(content_info: &[u8]) -> Vec<Vec<u8>> {
+    let ts_oid = oid(OID_SIGNATURE_TIME_STAMP);
+    let mut out = Vec::new();
+    let Some((_, mut infos)) = signed_data_parts(content_info) else { return out };
+    while let Some((_, info, more)) = read_tlv(infos) {
+        let mut fields = info;
+        while let Some((tag, v, next)) = read_tlv(fields) {
+            if tag == 0xA1 {
+                let mut attrs = v;
+                while let Some((_, attr, more_attrs)) = read_tlv(attrs) {
+                    if let Some((_, values, _)) = tlv_bytes(attr).filter(|a| a.starts_with(&ts_oid)).and_then(|_| read_tlv(&attr[ts_oid.len()..])) {
+                        let mut values = values;
+                        while let Some(token) = tlv_bytes(values) {
+                            out.push(token.to_vec());
+                            values = &values[token.len()..];
+                        }
+                    }
+                    attrs = more_attrs;
+                }
+            }
+            fields = next;
+        }
+        infos = more;
+    }
+    out
+}
+
+/// Certificates of a signature and of its time-stamp tokens.
+pub fn all_certificates(content_info: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = certificates(content_info);
+    for token in timestamp_tokens(content_info) {
+        out.extend(certificates(&token));
+    }
+    out
 }
 
 // ---------- RFC 3161 time-stamp protocol ----------

@@ -58,6 +58,29 @@ jobs:
       - name: Validate the signed PDF independently
         run: python scripts/validate_signature.py ci-test/test.pdf.signed.pdf ci-test/certs/ci.crt
 
+      # Long-term validation (#38): a test PKI with its own CRL and OCSP responder on 127.0.0.1,
+      # the DigiCert TSA for the signature and the archive time-stamp.
+      - name: E2E PAdES B-LT / B-LTA validated with pyhanko (offline, DSS only)
+        env:
+          DOC_SIGNER_TSA: http://timestamp.digicert.com
+        run: |
+          set -euo pipefail
+          bash scripts/ltv_pki.sh ci-test/pki
+          (cd ci-test/pki && python -m http.server 8080 --bind 127.0.0.1 >/dev/null 2>&1 &)
+          (cd ci-test/pki && openssl ocsp -index index.txt -port 127.0.0.1:8081 -rsigner ocsp.pem -rkey ocsp.key -CA root.pem -ndays 1 >/dev/null 2>&1 &)
+          sleep 2
+          mkdir -p ci-test/ltv-certs
+          cp ci-test/pki/leaf.p12 ci-test/ltv-certs/
+          THUMB=$(openssl x509 -in ci-test/pki/leaf.pem -outform der | openssl sha1 | awk '{print $NF}' | tr '[:lower:]' '[:upper:]')
+          for level in LTV LTA; do
+            cp tests/fixtures/minimal.pdf "ci-test/$level.pdf"
+            env "DOC_SIGNER_$level=1" DOC_SIGNER_CERTS_DIR="$GITHUB_WORKSPACE/ci-test/ltv-certs" DOC_SIGNER_PASS=test \
+              DOC_SIGNER_THUMB="$THUMB" DOC_SIGNER_TEST_PDF="$GITHUB_WORKSPACE/ci-test/$level.pdf" \
+              cargo test signs_with -- --include-ignored --nocapture
+          done
+          python scripts/validate_signature.py ci-test/LTV.pdf.signed.pdf ci-test/pki/root.pem --expect-lt
+          python scripts/validate_signature.py ci-test/LTA.pdf.signed.pdf ci-test/pki/root.pem --expect-lta
+
       # Encrypted PDFs (#37): RC4-40/128, AES-128/256, user and owner passwords, restricted permissions.
       - name: E2E encrypted PDFs validated with pyhanko
         run: |
