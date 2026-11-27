@@ -28,9 +28,79 @@ impl CertInfo {
 }
 
 #[cfg(windows)]
-pub use win::{list_certificates, load_signer, root_store_certs, sign_data};
+pub use win::{check_chain, list_certificates, load_signer, root_store_certs, sign_data, verify_digest};
 #[cfg(not(windows))]
-pub use nix::{list_certificates, load_signer, root_store_certs, sign_data};
+pub use nix::{check_chain, list_certificates, load_signer, root_store_certs, sign_data, verify_digest};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashAlg {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl HashAlg {
+    pub fn digest(self, data: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        match self {
+            HashAlg::Sha1 => sha1::Sha1::digest(data).to_vec(),
+            HashAlg::Sha256 => sha2::Sha256::digest(data).to_vec(),
+            HashAlg::Sha384 => sha2::Sha384::digest(data).to_vec(),
+            HashAlg::Sha512 => sha2::Sha512::digest(data).to_vec(),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            HashAlg::Sha1 => "SHA-1",
+            HashAlg::Sha256 => "SHA-256",
+            HashAlg::Sha384 => "SHA-384",
+            HashAlg::Sha512 => "SHA-512",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChainProblem {
+    /// A certificate of the chain was not valid at the checked time.
+    NotTimeValid,
+    Revoked,
+    BadSignature,
+    /// The chain ends in a root that is not trusted by the operating system.
+    UntrustedRoot,
+    /// No path to a root could be built.
+    PartialChain,
+    Other(String),
+}
+
+/// Result of chain building: subject names from the leaf to the root, and what is wrong.
+#[derive(Clone, Debug)]
+pub struct Chain {
+    pub names: Vec<String>,
+    pub problems: Vec<ChainProblem>,
+}
+
+/// DER `SEQUENCE { INTEGER r, INTEGER s }` to fixed-size `r || s` (each `n` bytes).
+#[allow(dead_code)]
+pub(crate) fn ecdsa_der_to_raw(sig: &[u8], n: usize) -> Option<Vec<u8>> {
+    let (tag, body, _) = der_tlv(sig)?;
+    if tag != 0x30 {
+        return None;
+    }
+    let (_, r, rest) = der_tlv(body)?;
+    let (_, s, _) = der_tlv(rest)?;
+    let mut out = Vec::with_capacity(2 * n);
+    for int in [r, s] {
+        let int = &int[int.iter().take_while(|&&b| b == 0).count()..];
+        if int.len() > n {
+            return None;
+        }
+        out.extend(std::iter::repeat_n(0, n - int.len()));
+        out.extend_from_slice(int);
+    }
+    Some(out)
+}
 
 /// Self-signed roots the operating system trusts (read once).
 pub fn trusted_roots() -> &'static [crate::x509::Cert] {

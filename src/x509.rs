@@ -1,12 +1,27 @@
 //! Just enough X.509 parsing for collecting validation data: names, serial, public key and the
 //! AIA / CRL distribution point URLs.
 
+use chrono::{DateTime, NaiveDateTime, Utc};
+
 use crate::cms::read_tlv;
+
+/// UTCTime (tag 0x17) or GeneralizedTime (0x18, optional fraction) in UTC.
+pub fn parse_time(tag: u8, v: &[u8]) -> Option<DateTime<Utc>> {
+    let s = std::str::from_utf8(v).ok()?.trim_end_matches('Z');
+    let s = s.split(['.', ',']).next()?;
+    let full = match tag {
+        0x17 if s.len() == 12 => format!("{}{s}", if &s[..2] < "50" { "20" } else { "19" }),
+        0x18 if s.len() == 14 => s.to_string(),
+        _ => return None,
+    };
+    NaiveDateTime::parse_from_str(&full, "%Y%m%d%H%M%S").ok().map(|n| n.and_utc())
+}
 
 const OID_AIA: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01]; // 1.3.6.1.5.5.7.1.1
 const OID_CRL_DP: &[u8] = &[0x55, 0x1D, 0x1F]; // 2.5.29.31
 const OID_OCSP: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01]; // 1.3.6.1.5.5.7.48.1
 const OID_CA_ISSUERS: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x02]; // 1.3.6.1.5.5.7.48.2
+const OID_SKI: &[u8] = &[0x55, 0x1D, 0x0E]; // 2.5.29.14
 const OID_OCSP_NOCHECK: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01, 0x05]; // 1.3.6.1.5.5.7.48.1.5
 
 #[derive(Clone, Debug, Default)]
@@ -24,6 +39,10 @@ pub struct Cert {
     pub crl_urls: Vec<String>,
     /// The certificate is an OCSP responder that needs no revocation check itself.
     pub ocsp_nocheck: bool,
+    pub not_before: Option<DateTime<Utc>>,
+    pub not_after: Option<DateTime<Utc>>,
+    /// subjectKeyIdentifier (used by CMS SignerIdentifier `[0]`).
+    pub ski: Vec<u8>,
 }
 
 impl Cert {
@@ -34,6 +53,10 @@ impl Cert {
     /// Common name for messages, or the whole subject as a fallback.
     pub fn name(&self) -> String {
         name_cn(&self.subject).unwrap_or_else(|| "?".into())
+    }
+
+    pub fn issuer_name(&self) -> String {
+        name_cn(&self.issuer).unwrap_or_else(|| "?".into())
     }
 }
 
@@ -57,7 +80,9 @@ pub fn parse(der: &[u8]) -> Option<Cert> {
     let (_, _, r) = read_tlv(r)?; // signature algorithm
     let issuer = whole(r)?;
     let (_, _, r) = read_tlv(r)?;
-    let (_, _, r) = read_tlv(r)?; // validity
+    let (_, validity, r) = read_tlv(r)?;
+    let (t1, v1, rest) = read_tlv(validity)?;
+    let (t2, v2, _) = read_tlv(rest)?;
     let subject = whole(r)?;
     let (_, _, r) = read_tlv(r)?;
     let (_, spki, mut r) = read_tlv(r).filter(|t| t.0 == 0x30)?;
@@ -69,6 +94,8 @@ pub fn parse(der: &[u8]) -> Option<Cert> {
         issuer: issuer.to_vec(),
         subject: subject.to_vec(),
         public_key: key.get(1..)?.to_vec(),
+        not_before: parse_time(t1, v1),
+        not_after: parse_time(t2, v2),
         ..Default::default()
     };
     while let Some((tag, v, next)) = read_tlv(r) {
@@ -126,6 +153,11 @@ fn extension(c: &mut Cert, ext: &[u8]) {
             }
         }
         OID_OCSP_NOCHECK => c.ocsp_nocheck = true,
+        OID_SKI => {
+            if let Some((0x04, ski, _)) = read_tlv(value) {
+                c.ski = ski.to_vec();
+            }
+        }
         _ => {}
     }
 }
@@ -185,7 +217,7 @@ mod tests {
         let crldp = seq(&[&seq(&[&t(0xA0, &t(0xA0, &[t(0x86, b"ldap:///skip").as_slice(), t(0x86, b"http://ca.example/a b.crl").as_slice()].concat()))])]);
         let exts = seq(&[&seq(&[&t(0x06, OID_AIA), &t(0x04, &aia)]), &seq(&[&t(0x06, OID_CRL_DP), &t(0x01, &[0xFF]), &t(0x04, &crldp)]), &seq(&[&t(0x06, OID_OCSP_NOCHECK), &t(0x04, &[0x05, 0x00])])]);
         let spki = seq(&[&seq(&[&t(0x06, &[0x2A])]), &t(0x03, &[0x00, 1, 2, 3])]);
-        let tbs = seq(&[&t(0xA0, &t(0x02, &[2])), &t(0x02, &[0x00, 0x9F]), &seq(&[&t(0x06, &[0x2A])]), &name, &seq(&[]), &name, &spki, &t(0xA3, &exts)]);
+        let tbs = seq(&[&t(0xA0, &t(0x02, &[2])), &t(0x02, &[0x00, 0x9F]), &seq(&[&t(0x06, &[0x2A])]), &name, &seq(&[&t(0x17, b"250101000000Z"), &t(0x18, b"20351231235959Z")]), &name, &spki, &t(0xA3, &exts)]);
         let der = seq(&[&tbs, &seq(&[&t(0x06, &[0x2A])]), &t(0x03, &[0x00])]);
         let c = parse(&der).unwrap();
         assert_eq!(c.ocsp_urls, ["http://ocsp.example"]);
@@ -195,5 +227,9 @@ mod tests {
         assert_eq!(c.serial, [0x00, 0x9F]);
         assert_eq!(c.public_key, [1, 2, 3]);
         assert_eq!(c.name(), "Test CA");
+        assert_eq!(c.not_after.unwrap().format("%Y-%m-%d").to_string(), "2035-12-31");
+        assert_eq!(parse_time(0x17, b"260101120000Z").unwrap().to_rfc3339(), "2026-01-01T12:00:00+00:00");
+        assert_eq!(parse_time(0x18, b"20261127081650.123Z").unwrap().to_rfc3339(), "2026-11-27T08:16:50+00:00");
+        assert_eq!(parse_time(0x17, b"991231235959Z").unwrap().format("%Y").to_string(), "1999");
     }
 }

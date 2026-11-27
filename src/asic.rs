@@ -117,6 +117,57 @@ fn mime_type(name: &str) -> &'static str {
     }
 }
 
+fn u16le(b: &[u8], at: usize) -> Option<usize> {
+    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?) as usize)
+}
+
+fn u32le(b: &[u8], at: usize) -> Option<usize> {
+    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?) as usize)
+}
+
+/// Reads every entry of a ZIP file through its central directory (stored or deflated, no ZIP64),
+/// checking the CRC. Entries keep the archive order.
+pub fn read_zip(zip: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    use std::io::Read;
+    let bad = || anyhow::anyhow!("invalid or unsupported ZIP file");
+    // The end-of-central-directory record is within the last 64 KiB (comment) + 22 bytes.
+    let from = zip.len().saturating_sub(65_557);
+    let eocd = (from..zip.len().saturating_sub(21)).rev().find(|&i| zip[i..].starts_with(&0x06054b50u32.to_le_bytes())).ok_or_else(bad)?;
+    let count = u16le(zip, eocd + 10).ok_or_else(bad)?;
+    let mut p = u32le(zip, eocd + 16).ok_or_else(bad)?;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        if u32le(zip, p) != Some(0x02014b50) {
+            bail!(bad());
+        }
+        let method = u16le(zip, p + 10).ok_or_else(bad)?;
+        let crc = u32le(zip, p + 16).ok_or_else(bad)?;
+        let (csize, size) = (u32le(zip, p + 20).ok_or_else(bad)?, u32le(zip, p + 24).ok_or_else(bad)?);
+        let (nlen, xlen, clen) = (u16le(zip, p + 28).ok_or_else(bad)?, u16le(zip, p + 30).ok_or_else(bad)?, u16le(zip, p + 32).ok_or_else(bad)?);
+        let off = u32le(zip, p + 42).ok_or_else(bad)?;
+        let name = String::from_utf8_lossy(zip.get(p + 46..p + 46 + nlen).ok_or_else(bad)?).into_owned();
+        let start = off + 30 + u16le(zip, off + 26).ok_or_else(bad)? + u16le(zip, off + 28).ok_or_else(bad)?;
+        let raw = zip.get(start..start + csize).ok_or_else(bad)?;
+        let data = match method {
+            0 => raw.to_vec(),
+            8 => {
+                let mut v = Vec::with_capacity(size);
+                flate2::read::DeflateDecoder::new(raw).take(size as u64 + 1).read_to_end(&mut v)?;
+                v
+            }
+            _ => bail!(bad()),
+        };
+        let mut c = flate2::Crc::new();
+        c.update(&data);
+        if c.sum() as usize != crc || data.len() != size {
+            bail!("{name}: CRC error");
+        }
+        out.push((name, data));
+        p += 46 + nlen + xlen + clen;
+    }
+    Ok(out)
+}
+
 /// Minimal ZIP writer (no ZIP64): stored or deflated entries, UTF-8 names.
 #[derive(Default)]
 struct ZipWriter {
@@ -195,46 +246,9 @@ impl ZipWriter {
 mod tests {
     use super::*;
     use crate::cms::KeyAlg;
-    use std::io::Read;
 
     fn signer() -> SignerCert {
         SignerCert { der: vec![0x30, 0], issuer_der: vec![0x30, 0], serial_be: vec![1], chain: vec![vec![0x30, 0]], alg: KeyAlg::Rsa }
-    }
-
-    fn u16le(b: &[u8], at: usize) -> usize {
-        u16::from_le_bytes([b[at], b[at + 1]]) as usize
-    }
-
-    fn u32le(b: &[u8], at: usize) -> usize {
-        u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]) as usize
-    }
-
-    /// Reads every entry back through the central directory.
-    fn entries(zip: &[u8]) -> Vec<(String, Vec<u8>)> {
-        let eocd = zip.len() - 22;
-        assert_eq!(u32le(zip, eocd), 0x06054b50);
-        let (count, mut p) = (u16le(zip, eocd + 10), u32le(zip, eocd + 16));
-        let mut out = Vec::new();
-        for _ in 0..count {
-            assert_eq!(u32le(zip, p), 0x02014b50);
-            let (method, csize, nlen, off) = (u16le(zip, p + 10), u32le(zip, p + 20), u16le(zip, p + 28), u32le(zip, p + 42));
-            let name = String::from_utf8(zip[p + 46..p + 46 + nlen].to_vec()).unwrap();
-            let start = off + 30 + u16le(zip, off + 26) + u16le(zip, off + 28);
-            let raw = &zip[start..start + csize];
-            let data = if method == 8 {
-                let mut v = Vec::new();
-                flate2::read::DeflateDecoder::new(raw).read_to_end(&mut v).unwrap();
-                v
-            } else {
-                raw.to_vec()
-            };
-            let mut crc = flate2::Crc::new();
-            crc.update(&data);
-            assert_eq!(crc.sum() as usize, u32le(zip, p + 16), "crc of {name}");
-            out.push((name, data));
-            p += 46 + nlen;
-        }
-        out
     }
 
     #[test]
@@ -244,11 +258,11 @@ mod tests {
         let zip = build(&files, &signer(), &fake, None).unwrap();
         // `mimetype` first, stored, no extra field, so readers can sniff the type at offset 38.
         assert_eq!(&zip[30..38], b"mimetype");
-        assert_eq!(u16le(&zip, 8), 0);
-        assert_eq!(u16le(&zip, 28), 0);
+        assert_eq!(u16le(&zip, 8), Some(0));
+        assert_eq!(u16le(&zip, 28), Some(0));
         assert_eq!(&zip[38..38 + MIMETYPE.len()], MIMETYPE.as_bytes());
 
-        let e = entries(&zip);
+        let e = read_zip(&zip).unwrap();
         let names: Vec<&str> = e.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["mimetype", "report.docx", "бележки и данни.txt", MANIFEST, SIGNATURE]);
         assert_eq!(e[1].1, files[0].1);

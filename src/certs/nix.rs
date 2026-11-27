@@ -337,6 +337,72 @@ pub fn sign_data(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>>
     find(thumbprint)?.sign(data, alg)
 }
 
+/// Verifies a PKCS#1 v1.5 (RSA) or DER-encoded ECDSA `signature` over a precomputed `digest`
+/// with the public key of `cert_der`.
+pub fn verify_digest(cert_der: &[u8], hash: super::HashAlg, digest: &[u8], signature: &[u8]) -> Result<bool> {
+    use openssl::md::Md;
+    use openssl::pkey_ctx::PkeyCtx;
+    let key = X509::from_der(cert_der)?.public_key()?;
+    let mut ctx = PkeyCtx::new(&key)?;
+    ctx.verify_init()?;
+    if key.id() == openssl::pkey::Id::RSA {
+        ctx.set_rsa_padding(openssl::rsa::Padding::PKCS1)?;
+        ctx.set_signature_md(match hash {
+            super::HashAlg::Sha1 => Md::sha1(),
+            super::HashAlg::Sha256 => Md::sha256(),
+            super::HashAlg::Sha384 => Md::sha384(),
+            super::HashAlg::Sha512 => Md::sha512(),
+        })?;
+    }
+    Ok(ctx.verify(digest, signature).unwrap_or(false))
+}
+
+/// Builds the chain of `cert_der` with the help of `extra` certificates, as of `at`, and checks
+/// it against the system CA bundle. Revocation is not checked.
+pub fn check_chain(cert_der: &[u8], extra: &[Vec<u8>], at: chrono::DateTime<chrono::Utc>) -> Result<super::Chain> {
+    use super::ChainProblem as P;
+    use openssl::stack::Stack;
+    use openssl::x509::store::X509StoreBuilder;
+    use openssl::x509::verify::X509VerifyParam;
+    use openssl::x509::X509StoreContext;
+    let leaf = X509::from_der(cert_der)?;
+    let mut builder = X509StoreBuilder::new()?;
+    builder.set_default_paths()?;
+    for root in root_store_certs() {
+        if let Ok(c) = X509::from_der(&root) {
+            let _ = builder.add_cert(c);
+        }
+    }
+    let mut param = X509VerifyParam::new()?;
+    param.set_time(at.timestamp() as _);
+    builder.set_param(&param)?;
+    let store = builder.build();
+    let mut untrusted = Stack::new()?;
+    for c in extra {
+        if let Ok(c) = X509::from_der(c) {
+            untrusted.push(c)?;
+        }
+    }
+    let mut ctx = X509StoreContext::new()?;
+    let (ok, err, names) = ctx.init(&store, &leaf, &untrusted, |c| {
+        let ok = c.verify_cert()?;
+        let names: Vec<String> = c.chain().map(|ch| ch.iter().map(|x| display_name(x.subject_name())).collect()).unwrap_or_default();
+        Ok((ok, c.error(), names))
+    })?;
+    let mut problems = Vec::new();
+    if !ok {
+        problems.push(match err.as_raw() {
+            9 | 10 => P::NotTimeValid,
+            23 => P::Revoked,
+            7 => P::BadSignature,
+            18 | 19 => P::UntrustedRoot,
+            2 | 20 | 21 => P::PartialChain,
+            _ => P::Other(err.error_string().to_string()),
+        });
+    }
+    Ok(super::Chain { names: if names.is_empty() { vec![display_name(leaf.subject_name())] } else { names }, problems })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

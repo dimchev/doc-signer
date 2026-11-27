@@ -238,3 +238,94 @@ pub fn sign_data(thumbprint: &[u8], data: &[u8], alg: KeyAlg) -> Result<Vec<u8>>
     }
 }
 
+
+/// Verifies a PKCS#1 v1.5 (RSA) or DER-encoded ECDSA `signature` over a precomputed `digest`
+/// with the public key of `cert_der`.
+pub fn verify_digest(cert_der: &[u8], hash: super::HashAlg, digest: &[u8], signature: &[u8]) -> Result<bool> {
+    unsafe {
+        let ctx = CertCreateCertificateContext(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, cert_der);
+        if ctx.is_null() {
+            bail!("invalid certificate");
+        }
+        let cert = Cert(ctx);
+        let info = &*(*cert.0).pCertInfo;
+        let mut key = BCRYPT_KEY_HANDLE::default();
+        CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING, &info.SubjectPublicKeyInfo, CRYPT_IMPORT_PUBLIC_KEY_FLAGS(0), None, &mut key)?;
+        let alg_oid = info.SubjectPublicKeyInfo.Algorithm.pszObjId.to_string().unwrap_or_default();
+        let ok = if alg_oid == "1.2.840.10045.2.1" {
+            // CNG wants r || s, each as long as the key.
+            let mut bits = [0u8; 4];
+            let mut got = 0u32;
+            let _ = BCryptGetProperty(key.into(), BCRYPT_KEY_LENGTH, Some(&mut bits), &mut got, 0);
+            let n = (u32::from_le_bytes(bits) as usize).div_ceil(8);
+            match super::ecdsa_der_to_raw(signature, n) {
+                Some(raw) => BCryptVerifySignature(key, None, digest, &raw, BCRYPT_FLAGS(0)).is_ok(),
+                None => false,
+            }
+        } else {
+            let alg = match hash {
+                super::HashAlg::Sha1 => BCRYPT_SHA1_ALGORITHM,
+                super::HashAlg::Sha256 => BCRYPT_SHA256_ALGORITHM,
+                super::HashAlg::Sha384 => BCRYPT_SHA384_ALGORITHM,
+                super::HashAlg::Sha512 => BCRYPT_SHA512_ALGORITHM,
+            };
+            let padding = BCRYPT_PKCS1_PADDING_INFO { pszAlgId: alg };
+            BCryptVerifySignature(key, Some(&padding as *const _ as *const c_void), digest, signature, BCRYPT_PAD_PKCS1).is_ok()
+        };
+        let _ = BCryptDestroyKey(key);
+        Ok(ok)
+    }
+}
+
+/// Builds the chain of `cert_der` with the help of `extra` certificates, as of `at`, and checks
+/// it against the Windows trust store. Revocation is not checked.
+pub fn check_chain(cert_der: &[u8], extra: &[Vec<u8>], at: chrono::DateTime<chrono::Utc>) -> Result<super::Chain> {
+    use super::ChainProblem as P;
+    unsafe {
+        let store = Store(CertOpenStore(CERT_STORE_PROV_MEMORY, CERT_QUERY_ENCODING_TYPE(0), None, CERT_OPEN_STORE_FLAGS(0), None)?);
+        for c in extra {
+            let _ = CertAddEncodedCertificateToStore(Some(store.0), X509_ASN_ENCODING, c, CERT_STORE_ADD_USE_EXISTING, None);
+        }
+        let mut leaf: *mut CERT_CONTEXT = null_mut();
+        CertAddEncodedCertificateToStore(Some(store.0), X509_ASN_ENCODING, cert_der, CERT_STORE_ADD_USE_EXISTING, Some(&mut leaf))?;
+        let leaf = Cert(leaf);
+        let ticks = at.timestamp() * 10_000_000 + 116_444_736_000_000_000;
+        let ft = windows::Win32::Foundation::FILETIME { dwLowDateTime: ticks as u32, dwHighDateTime: (ticks >> 32) as u32 };
+        let para = CERT_CHAIN_PARA { cbSize: size_of::<CERT_CHAIN_PARA>() as u32, ..Default::default() };
+        let mut chain: *mut CERT_CHAIN_CONTEXT = null_mut();
+        // Cache-only retrieval: no network access while verifying.
+        CertGetCertificateChain(None, leaf.0, Some(&ft), Some(store.0), &para, CERT_CHAIN_CACHE_ONLY_URL_RETRIEVAL, None, &mut chain)?;
+        let status = (*chain).TrustStatus.dwErrorStatus;
+        let mut names = Vec::new();
+        if (*chain).cChain > 0 {
+            let simple = *(*chain).rgpChain;
+            for i in 0..(*simple).cElement as usize {
+                let el = *(*simple).rgpElement.add(i);
+                names.push(name_string((*el).pCertContext, 0));
+            }
+        }
+        CertFreeCertificateChain(chain);
+        let mut problems = Vec::new();
+        if status & 0x1 != 0 {
+            problems.push(P::NotTimeValid);
+        }
+        if status & 0x4 != 0 {
+            problems.push(P::Revoked);
+        }
+        if status & 0x8 != 0 {
+            problems.push(P::BadSignature);
+        }
+        if status & 0x20 != 0 {
+            problems.push(P::UntrustedRoot);
+        }
+        if status & 0x10000 != 0 {
+            problems.push(P::PartialChain);
+        }
+        // Usage, policy and constraint errors; revocation-unknown (0x40, 0x1000000) is expected.
+        let known = 0x1 | 0x4 | 0x8 | 0x20 | 0x10000 | 0x40 | 0x1000000;
+        if status & !known != 0 {
+            problems.push(P::Other(format!("0x{:08X}", status & !known)));
+        }
+        Ok(super::Chain { names, problems })
+    }
+}
