@@ -96,6 +96,17 @@ jobs:
           sign aes-256-user.pdf user
           sign aes-256-no-signing.pdf owner
 
+      # XAdES for XML (#41): enveloped XAdES-B-T, validated by signxml (an independent implementation).
+      - name: E2E XAdES validated with signxml
+        env:
+          DOC_SIGNER_TSA: http://timestamp.digicert.com
+        run: |
+          set -euo pipefail
+          pip install signxml
+          printf '<?xml version="1.0" encoding="UTF-8"?>\n<Invoice xmlns="urn:example:invoice">\n  <ID>CI-1</ID>\n  <Note>Тест</Note>\n</Invoice>\n' > ci-test/invoice.xml
+          DOC_SIGNER_TEST_XML="$GITHUB_WORKSPACE/ci-test/invoice.xml" cargo test xades_with -- --include-ignored --nocapture
+          python scripts/validate_xades.py ci-test/invoice.xml.signed.xml ci-test/certs/ci.crt
+
       # Any file as CAdES .p7s / .p7m, verified by OpenSSL (#35).
       - name: E2E .p7s / .p7m verified with OpenSSL
         run: |

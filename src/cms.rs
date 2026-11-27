@@ -124,7 +124,7 @@ pub fn signed_attributes_at(content_digest: &[u8], cert_der: &[u8], signing_time
 }
 
 /// NCrypt returns ECDSA signatures as r||s; CMS wants SEQUENCE { r INTEGER, s INTEGER }.
-fn ecdsa_raw_to_der(raw: &[u8]) -> Vec<u8> {
+pub(crate) fn ecdsa_raw_to_der(raw: &[u8]) -> Vec<u8> {
     let (r, s) = raw.split_at(raw.len() / 2);
     seq(&[&uint(r), &uint(s)])
 }

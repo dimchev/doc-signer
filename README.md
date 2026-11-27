@@ -13,6 +13,7 @@ Prebuilt binaries (built from `master` by GitHub Actions) are on the [Releases p
 
 - Sign one or many PDF files (button, `Ctrl+O`, drag & drop of files or a folder, or command-line arguments).
 - **Any other file** (docx, xlsx, odt, images, zip, …) is signed as a whole with a CAdES signature: **`.p7s`** (separate signature file, the original stays unchanged) or **`.p7m`** (the file embedded in the signature). Verify e.g. with `openssl cms -verify -binary -inform DER -in file.docx.p7s -content file.docx -CAfile <root>` or the EU DSS validator.
+- **XML files** are signed with **XAdES** (ETSI EN 319 132, the usual format for e-invoices and submissions to institutions): inside the XML (*enveloped*, default; the rest of the document is unchanged) or as a separate `file.xml.xades.xml` (*detached*), chosen under Output. XAdES-B-B, or XAdES-B-T with the timestamp option. Exclusive XML canonicalization, RSA or ECDSA with SHA-256, SigningCertificateV2, SigningTime and DataObjectFormat. *Verify* also checks XAdES made by other tools (Canonical XML 1.0 / 1.1 / exclusive, enveloped and detached, also inside ASiC-E containers).
 - **ASiC-E container** (`.asice`, ETSI EN 319 162-1): choose *.asice* under Output to pack all checked non-PDF files into one ZIP with `META-INF/ASiCManifest.xml` (SHA-256 of every file) and one CAdES signature over it (`META-INF/signature001.p7s`). The container is named after the first file. Open it with any ZIP tool, or validate it with the EU DSS validator.
 - Choose a personal certificate with a private key. Certificates with the document-signing extended key usage are sorted to the top and marked with ★.
 - The signature is PAdES (`ETSI.CAdES.detached`, SHA-256) and is added as an *incremental update*, so existing signatures stay valid.
@@ -113,7 +114,8 @@ CI does this on Linux (OpenSSL key from a file) and on Windows (a throwaway CNG 
 
 - Encrypted PDFs with a certificate (public-key) security handler are not supported, only the standard password handler.
 - Without a time stamp the signature is PAdES **B-B**; with *Add trusted timestamp (TSA)* it is **B-T**, plus **B-LT** / **B-LTA** with the long-term options.
-- *Verify* does not check revocation (OCSP / CRL) and does not support XAdES (`signatures.xml`) or RSASSA-PSS signatures.
+- *Verify* does not check revocation (OCSP / CRL) and does not support RSASSA-PSS signatures or XPath / XSLT transforms in XML signatures.
+- XML: UTF-8 documents only, without custom DTD entities. XAdES is signed as B-B / B-T (no XAdES-LT/LTA yet).
 - Revocation data is fetched over HTTP(S) only (no LDAP). The validation data is added for the new signature, not refreshed for older signatures in the document.
 - RSA and ECDSA keys are supported (ECDSA on Windows only as CNG keys; legacy CSP keys are RSA-only).
 - ASiC-E containers are created, not opened or extended; a container is limited to 4 GB (no ZIP64). PDFs are always signed as PAdES and not packed into the container.
