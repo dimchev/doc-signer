@@ -104,8 +104,14 @@ jobs:
           set -euo pipefail
           pip install signxml
           printf '<?xml version="1.0" encoding="UTF-8"?>\n<Invoice xmlns="urn:example:invoice">\n  <ID>CI-1</ID>\n  <Note>Тест</Note>\n</Invoice>\n' > ci-test/invoice.xml
-          DOC_SIGNER_TEST_XML="$GITHUB_WORKSPACE/ci-test/invoice.xml" cargo test xades_with -- --include-ignored --nocapture
-          python scripts/validate_xades.py ci-test/invoice.xml.signed.xml ci-test/certs/ci.crt
+          # signxml validates the chain strictly (keyUsage etc.), so use a proper CA + leaf.
+          bash scripts/ltv_pki.sh ci-test/xades-pki
+          mkdir -p ci-test/xades-certs
+          cp ci-test/xades-pki/leaf.p12 ci-test/xades-certs/
+          THUMB=$(openssl x509 -in ci-test/xades-pki/leaf.pem -outform der | openssl sha1 | awk '{print $NF}' | tr '[:lower:]' '[:upper:]')
+          DOC_SIGNER_CERTS_DIR="$GITHUB_WORKSPACE/ci-test/xades-certs" DOC_SIGNER_PASS=test DOC_SIGNER_THUMB="$THUMB" \
+            DOC_SIGNER_TEST_XML="$GITHUB_WORKSPACE/ci-test/invoice.xml" cargo test xades_with -- --include-ignored --nocapture
+          python scripts/validate_xades.py ci-test/invoice.xml.signed.xml ci-test/xades-pki/root.pem
 
       # Any file as CAdES .p7s / .p7m, verified by OpenSSL (#35).
       - name: E2E .p7s / .p7m verified with OpenSSL
