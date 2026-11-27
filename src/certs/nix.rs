@@ -386,7 +386,7 @@ pub fn check_chain(cert_der: &[u8], extra: &[Vec<u8>], at: chrono::DateTime<chro
     let mut ctx = X509StoreContext::new()?;
     let (ok, err, names) = ctx.init(&store, &leaf, &untrusted, |c| {
         let ok = c.verify_cert()?;
-        let names = c.chain().map(|ch| ch.iter().map(|x| display_name(x.subject_name())).collect()).unwrap_or_default();
+        let names: Vec<String> = c.chain().map(|ch| ch.iter().map(|x| display_name(x.subject_name())).collect()).unwrap_or_default();
         Ok((ok, c.error(), names))
     })?;
     let mut problems = Vec::new();
