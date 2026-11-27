@@ -214,6 +214,8 @@ struct CmsCheck {
     signature: Line,
     signing_time: Option<DateTime<Utc>>,
     tokens: Vec<Vec<u8>>,
+    /// The bytes the signature time-stamp covers (CMS: the signature value; XAdES: the
+    /// canonical ds:SignatureValue element).
     signature_value: Vec<u8>,
     econtent: Option<Vec<u8>>,
     weak: bool,
@@ -610,10 +612,24 @@ pub fn verify_asic(bytes: &[u8]) -> Result<Vec<Report>> {
     let data_files: Vec<&(String, Vec<u8>)> = entries.iter().filter(|(n, _)| n != "mimetype" && !n.starts_with("META-INF/") && !n.ends_with('/')).collect();
     let sig_names: Vec<&String> = entries.iter().map(|(n, _)| n).filter(|n| n.starts_with("META-INF/") && n.to_ascii_lowercase().contains("signature") && n.ends_with(".p7s")).collect();
     if sig_names.is_empty() {
-        if entries.iter().any(|(n, _)| n.starts_with("META-INF/") && n.contains("signatures") && n.ends_with(".xml")) {
-            bail!("{}", v.xades_unsupported);
+        let xades: Vec<&(String, Vec<u8>)> = entries.iter().filter(|(n, _)| n.starts_with("META-INF/") && n.contains("signatures") && n.ends_with(".xml")).collect();
+        if xades.is_empty() {
+            bail!("{}", v.no_signatures);
         }
-        bail!("{}", v.no_signatures);
+        let resolve = |uri: &str| get(&percent_decode(uri)).map(<[u8]>::to_vec);
+        let mut reports = Vec::new();
+        for (name, xml) in xades {
+            for mut r in verify_xades(xml, &resolve)? {
+                r.level = format!("ASiC-E {}", r.level);
+                r.title = format!("{} ({})", r.title, name.trim_start_matches("META-INF/"));
+                let uncovered: Vec<String> = data_files.iter().map(|(n, _)| n.clone()).filter(|n| !r.facts.iter().any(|(_, f)| f.split(", ").any(|x| x == n))).collect();
+                if !uncovered.is_empty() {
+                    r.checks.push(line(Status::Warn, v.files_not_covered.replace("{files}", &uncovered.join(", "))));
+                }
+                reports.push(r);
+            }
+        }
+        return Ok(reports);
     }
     let manifests: Vec<(&String, String)> = entries
         .iter()
@@ -664,6 +680,13 @@ pub fn verify_asic(bytes: &[u8]) -> Result<Vec<Report>> {
 }
 
 /// Whether the file type can be verified (PDFs are checked separately for signatures).
+/// XML file that contains an XML signature (reads at most the first 64 MB).
+pub fn is_signed_xml(path: &Path) -> bool {
+    crate::xades::is_xml(path)
+        && std::fs::metadata(path).is_ok_and(|m| m.len() < 64 << 20)
+        && std::fs::read(path).is_ok_and(|b| b.windows(crate::xades::NS_DS.len()).any(|w| w == crate::xades::NS_DS.as_bytes()))
+}
+
 pub fn is_signature_file(path: &Path) -> bool {
     path.extension().map(|e| e.to_ascii_lowercase()).is_some_and(|e| ["p7s", "p7m", "asice", "sce", "asics", "scs"].iter().any(|x| e == *x))
 }
@@ -671,11 +694,227 @@ pub fn is_signature_file(path: &Path) -> bool {
 pub fn verify_file(path: &Path, password: Option<&str>) -> Result<Vec<Report>> {
     let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     match ext.as_str() {
+        "xml" => {
+            let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+            // Detached references: only files in the same folder.
+            let resolve = |uri: &str| {
+                let name = percent_decode(uri);
+                let file = Path::new(&name).file_name()?;
+                std::fs::read(dir.join(file)).ok()
+            };
+            verify_xades(&std::fs::read(path)?, &resolve)
+        }
         "pdf" => verify_pdf(&std::fs::read(path)?, password),
         "p7s" | "p7m" => verify_cades(path),
         "asice" | "sce" | "asics" | "scs" => verify_asic(&std::fs::read(path)?),
         _ => bail!("{}", t().verify.no_signatures),
     }
+}
+
+// ---------- XAdES / XML-DSig ----------
+
+fn xml_hash(uri: &str) -> Option<HashAlg> {
+    match uri {
+        "http://www.w3.org/2000/09/xmldsig#sha1" => Some(HashAlg::Sha1),
+        "http://www.w3.org/2001/04/xmlenc#sha256" => Some(HashAlg::Sha256),
+        "http://www.w3.org/2001/04/xmldsig-more#sha384" => Some(HashAlg::Sha384),
+        "http://www.w3.org/2001/04/xmlenc#sha512" => Some(HashAlg::Sha512),
+        _ => None,
+    }
+}
+
+/// (hash, ECDSA?) of an XML-DSig SignatureMethod.
+fn xml_sig_alg(uri: &str) -> Option<(HashAlg, bool)> {
+    let (alg, hash) = uri.rsplit_once('#')?;
+    let ecdsa = match hash.split('-').next()? {
+        "rsa" => false,
+        "ecdsa" => true,
+        _ => return None,
+    };
+    let h = match hash.rsplit('-').next()? {
+        "sha1" => HashAlg::Sha1,
+        "sha256" => HashAlg::Sha256,
+        "sha384" => HashAlg::Sha384,
+        "sha512" => HashAlg::Sha512,
+        _ => return None,
+    };
+    let _ = alg;
+    Some((h, ecdsa))
+}
+
+fn b64_text(s: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let clean: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD.decode(clean).ok()
+}
+
+/// Canonicalization settings of a `CanonicalizationMethod` / `Transform` element.
+fn c14n_of(doc: &crate::xml::Doc, el: usize) -> Option<crate::xml::C14n> {
+    let mut c = crate::xml::C14n::from_uri(doc.attr(el, "Algorithm")?)?;
+    if let Some(inc) = doc.child(el, crate::xml::EXC_C14N, "InclusiveNamespaces") {
+        c.inclusive_prefixes = doc.attr(inc, "PrefixList").unwrap_or_default().split_whitespace().map(str::to_string).collect();
+    }
+    Some(c)
+}
+
+/// Verifies every `ds:Signature` in an XML document. `resolve` returns the content of
+/// external references (detached signatures, ASiC containers).
+pub fn verify_xades(bytes: &[u8], resolve: &dyn Fn(&str) -> Option<Vec<u8>>) -> Result<Vec<Report>> {
+    use crate::xades::{ENVELOPED, NS_DS, SIGNED_PROPERTIES};
+    use crate::xml;
+    let v = &t().verify;
+    let doc = xml::parse(bytes)?;
+    let sigs: Vec<usize> = doc.descendants(0).into_iter().filter(|&n| doc.is(n, NS_DS, "Signature")).collect();
+    if sigs.is_empty() {
+        bail!("{}", v.no_signatures);
+    }
+    let ns_xades = [crate::xades::NS_XADES, "http://uri.etsi.org/01903/v1.4.1#", "http://uri.etsi.org/01903/v1.1.1#"];
+    let find = |under: usize, local: &str| doc.descendants(under).into_iter().find(|&n| doc.name(n).is_some_and(|(ns, l)| l == local && (ns_xades.contains(&ns.as_str()) || ns == NS_DS)));
+    let mut reports = Vec::new();
+    for (i, &s) in sigs.iter().enumerate() {
+        let title = format!("XAdES #{}", i + 1);
+        let mut problems: Vec<String> = Vec::new();
+        let mut unsupported: Vec<String> = Vec::new();
+        let si = doc.child(s, NS_DS, "SignedInfo").ok_or_else(|| anyhow!("{}: SignedInfo", v.err_cms))?;
+        let si_c14n = doc.child(si, NS_DS, "CanonicalizationMethod").and_then(|c| c14n_of(&doc, c));
+        // References.
+        let mut referenced = Vec::new();
+        let mut has_props_ref = false;
+        for r in doc.elements(si).filter(|&r| doc.is(r, NS_DS, "Reference")) {
+            let uri = doc.attr(r, "URI").unwrap_or_default().to_string();
+            if doc.attr(r, "Type") == Some(SIGNED_PROPERTIES) {
+                has_props_ref = true;
+            }
+            let mut exclude = None;
+            let mut c14n: Option<xml::C14n> = None;
+            if let Some(tr) = doc.child(r, NS_DS, "Transforms") {
+                for tf in doc.elements(tr) {
+                    let alg = doc.attr(tf, "Algorithm").unwrap_or_default();
+                    if alg == ENVELOPED {
+                        exclude = Some(s);
+                    } else if let Some(c) = c14n_of(&doc, tf) {
+                        c14n = Some(c);
+                    } else {
+                        unsupported.push(alg.to_string());
+                    }
+                }
+            }
+            let digest_alg = doc.child(r, NS_DS, "DigestMethod").and_then(|d| doc.attr(d, "Algorithm")).unwrap_or_default();
+            let expected = doc.child(r, NS_DS, "DigestValue").map(|d| doc.text(d)).and_then(|t| b64_text(&t));
+            let Some(h) = xml_hash(digest_alg) else {
+                unsupported.push(digest_alg.to_string());
+                continue;
+            };
+            let data = if uri.is_empty() || uri.starts_with('#') {
+                let node = if uri.is_empty() { Some(0) } else { doc.by_id(&uri[1..]) };
+                // Same-document references never include comments. Without a C14N transform the
+                // specification uses inclusive C14N 1.0; some signers (e.g. signxml) use the
+                // SignedInfo method instead, so that is accepted too.
+                let opts = xml::C14n { comments: false, ..c14n.clone().unwrap_or_default() };
+                let mut out = node.map(|n| xml::canonicalize(&doc, n, &opts, exclude));
+                if c14n.is_none()
+                    && let (Some(n), Some(alt)) = (node, si_c14n.clone())
+                    && out.as_ref().map(|d| h.digest(d)) != expected
+                {
+                    out = Some(xml::canonicalize(&doc, n, &xml::C14n { comments: false, ..alt }, exclude));
+                }
+                out
+            } else {
+                referenced.push(percent_decode(&uri));
+                resolve(&uri).and_then(|raw| match &c14n {
+                    Some(opts) => xml::parse(&raw).ok().map(|d| xml::canonicalize(&d, 0, opts, None)),
+                    None => Some(raw),
+                })
+            };
+            let ok = data.as_ref().is_some_and(|d| Some(h.digest(d)) == expected);
+            if !ok {
+                let label = if uri.is_empty() { v.whole_document.to_string() } else { percent_decode(&uri) };
+                problems.push(if data.is_none() { v.reference_missing.replace("{uri}", &label) } else { label });
+            }
+        }
+        let integrity = if !problems.is_empty() {
+            line(Status::Fail, format!("{} ({})", v.integrity_fail, problems.join(", ")))
+        } else if !unsupported.is_empty() {
+            line(Status::Warn, v.unsupported_alg.replace("{alg}", &unsupported.join(", ")))
+        } else {
+            line(Status::Ok, v.integrity_ok)
+        };
+
+        // Certificates: KeyInfo and (XAdES-LT) CertificateValues.
+        let mut certs: Vec<Vec<u8>> = doc.descendants(s).into_iter().filter(|&n| doc.name(n).is_some_and(|(_, l)| l == "X509Certificate" || l == "EncapsulatedX509Certificate")).filter_map(|n| b64_text(&doc.text(n))).collect();
+        certs.dedup();
+        let parsed: Vec<Cert> = certs.iter().filter_map(|d| x509::parse(d)).collect();
+        // SigningCertificate(V2): the signer is the certificate whose digest is referenced.
+        let cert_refs: Vec<(HashAlg, Vec<u8>)> = find(s, "SigningCertificateV2")
+            .or_else(|| find(s, "SigningCertificate"))
+            .map(|sc| {
+                doc.descendants(sc)
+                    .into_iter()
+                    .filter(|&n| doc.name(n).is_some_and(|(_, l)| l == "CertDigest"))
+                    .filter_map(|cd| {
+                        let h = xml_hash(doc.child(cd, NS_DS, "DigestMethod").and_then(|m| doc.attr(m, "Algorithm"))?)?;
+                        Some((h, b64_text(&doc.text(doc.child(cd, NS_DS, "DigestValue")?))?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let signer = if cert_refs.is_empty() {
+            parsed.first().cloned()
+        } else {
+            parsed.iter().find(|c| cert_refs.iter().any(|(h, d)| h.digest(&c.der) == *d)).cloned()
+        };
+
+        let sig_method = doc.child(si, NS_DS, "SignatureMethod").and_then(|m| doc.attr(m, "Algorithm")).unwrap_or_default();
+        let value_el = doc.child(s, NS_DS, "SignatureValue");
+        let value = value_el.and_then(|e| b64_text(&doc.text(e))).unwrap_or_default();
+        let mut weak = false;
+        let signature = match (&signer, xml_sig_alg(sig_method), &si_c14n) {
+            (None, _, _) if !cert_refs.is_empty() => line(Status::Fail, v.signing_cert_mismatch),
+            (None, _, _) => line(Status::Fail, v.signer_cert_missing),
+            (_, None, _) => line(Status::Warn, v.unsupported_alg.replace("{alg}", sig_method)),
+            (_, _, None) => line(Status::Warn, v.unsupported_alg.replace("{alg}", "CanonicalizationMethod")),
+            (Some(cert), Some((h, ecdsa)), Some(opts)) => {
+                weak = h == HashAlg::Sha1;
+                let digest = h.digest(&xml::canonicalize(&doc, si, opts, None));
+                let sig = if ecdsa { cms::ecdsa_raw_to_der(&value) } else { value.clone() };
+                match certs::verify_digest(&cert.der, h, &digest, &sig) {
+                    Ok(true) => line(Status::Ok, v.signature_ok.replace("{alg}", h.name())),
+                    _ => line(Status::Fail, v.signature_fail),
+                }
+            }
+        };
+
+        // Signature time-stamps cover the canonical ds:SignatureValue element.
+        let mut tokens = Vec::new();
+        let mut stamped = Vec::new();
+        if let (Some(ts), Some(ve)) = (find(s, "SignatureTimeStamp"), value_el) {
+            let opts = doc.elements(ts).find(|&c| doc.is(c, NS_DS, "CanonicalizationMethod")).and_then(|c| c14n_of(&doc, c)).unwrap_or_default();
+            stamped = xml::canonicalize(&doc, ve, &opts, None);
+            if let Some(enc) = doc.elements(ts).find(|&c| doc.name(c).is_some_and(|(_, l)| l == "EncapsulatedTimeStamp")) {
+                tokens.extend(b64_text(&doc.text(enc)));
+            }
+        }
+        let signing_time = find(s, "SigningTime").and_then(|n| DateTime::parse_from_rfc3339(doc.text(n).trim()).ok()).map(|t| t.with_timezone(&Utc));
+        let check = CmsCheck { signer, certs: certs.clone(), integrity, signature, signing_time, tokens, signature_value: stamped, econtent: None, weak };
+        let mut r = Report::default();
+        let token = signature_report(title, &check, None, &[], &mut r);
+        if !referenced.is_empty() {
+            r.facts.push((v.files.into(), referenced.join(", ")));
+        }
+        let ts_ok = token.is_some_and(|tc| tc.line.status == Status::Ok);
+        let base = if has_props_ref { "XAdES" } else { "XML-DSig" };
+        r.level = match (ts_ok, find(s, "CertificateValues").is_some() || find(s, "RevocationValues").is_some(), find(s, "ArchiveTimeStamp").is_some()) {
+            (_, _, true) => format!("{base}-B-LTA"),
+            (true, true, _) => format!("{base}-B-LT"),
+            (true, false, _) => format!("{base}-B-T"),
+            _ => format!("{base}-B-B"),
+        };
+        if !has_props_ref {
+            r.level = base.into();
+        }
+        reports.push(r);
+    }
+    Ok(reports)
 }
 
 #[cfg(test)]
@@ -745,6 +984,25 @@ mod tests {
         assert_eq!(sig.as_deref(), Some("META-INF/signature001.p7s"));
         assert_eq!(refs, [("a%20b.txt".to_string(), "http://www.w3.org/2001/04/xmlenc#sha256".to_string(), "AAAA".to_string())]);
         assert_eq!(percent_decode("a%20b%D0%B1.txt"), "a bб.txt");
+    }
+
+    #[test]
+    fn verifies_xades_from_signxml() {
+        for name in ["signxml-rsa-c14n11.xml", "signxml-ecdsa-exc.xml"] {
+            let bytes = std::fs::read(format!("{}/tests/fixtures/xades/{name}", env!("CARGO_MANIFEST_DIR"))).unwrap();
+            let reports = verify_xades(&bytes, &|_| None).unwrap();
+            assert_eq!(reports.len(), 1, "{name}");
+            let r = &reports[0];
+            assert_eq!(r.checks[0].status, Status::Ok, "{name}: references {:?}", r.checks);
+            assert_eq!(r.checks[1].status, Status::Ok, "{name}: signature value {:?}", r.checks);
+            assert!(r.level.starts_with("XAdES"), "{name}: {}", r.level);
+            assert!(r.facts.iter().any(|(_, v)| v.contains("signxml fixture")), "{name}: {:?}", r.facts);
+
+            let tampered = String::from_utf8(bytes).unwrap().replacen(">42<", ">43<", 1);
+            let r = &verify_xades(tampered.as_bytes(), &|_| None).unwrap()[0];
+            assert_eq!(r.checks[0].status, Status::Fail, "{name}: tampering detected {:?}", r.checks);
+            assert_eq!(r.status(), Status::Fail);
+        }
     }
 
     #[test]

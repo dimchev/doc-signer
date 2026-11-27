@@ -16,7 +16,9 @@ mod style;
 mod style_ui;
 mod tsa;
 mod verify;
+mod xml;
 mod x509;
+mod xades;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -78,6 +80,8 @@ struct Doc {
     password: Option<String>,
     /// Why an encrypted PDF cannot be used yet (offers the password prompt).
     locked: Option<pdf::Locked>,
+    /// A signature file (.p7s, .p7m, ASiC) or an XML file that contains a signature.
+    sig_file: bool,
 }
 
 impl Doc {
@@ -126,6 +130,8 @@ struct App {
     use_lta: bool,
     /// Signature format for non-PDF files.
     cades_format: cades::Format,
+    /// Signature format for XML files.
+    xml_format: xades::XmlFormat,
     styles: style_ui::StyleUi,
     /// Corner being dragged on the page preview and the fixed opposite corner (page points).
     resizing: Option<(usize, egui::Pos2)>,
@@ -165,6 +171,7 @@ impl App {
             use_lta: settings::get("lta").as_deref() == Some("1"),
             tsa_url: settings::get("tsa_url").filter(|u| !u.trim().is_empty()).unwrap_or_else(|| tsa::DEFAULT_URL.into()),
             cades_format: cades::Format::from_code(settings::get("cades").as_deref().unwrap_or("p7s")),
+            xml_format: xades::XmlFormat::from_code(settings::get("xades").as_deref().unwrap_or("enveloped")),
             styles: style_ui::StyleUi::new(),
             resizing: None,
             output: Output::Suffix,
@@ -252,6 +259,7 @@ impl App {
             return;
         }
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let sig_file = verify::is_signature_file(&path) || verify::is_signed_xml(&path);
         let (info, locked) = if is_pdf {
             inspect_pdf(&path, None)
         } else {
@@ -265,7 +273,7 @@ impl App {
             self.push(Level::Err, format!("{}: {e}", path.display()));
         }
         let checked = info.is_ok();
-        self.docs.push(Doc { path, info, checked, status: Status::Ready, placement: None, size: None, style: None, pdf: is_pdf, bytes, password: None, locked });
+        self.docs.push(Doc { path, info, checked, status: Status::Ready, placement: None, size: None, style: None, pdf: is_pdf, bytes, password: None, locked, sig_file });
         if self.selected.is_none() {
             self.select(self.docs.len() - 1);
         }
@@ -326,6 +334,35 @@ impl App {
         p
     }
 
+    /// XAdES mode for a file, `None` = PDF or signed as any other file (CAdES).
+    fn xades_mode(&self, d: &Doc) -> Option<xades::Mode> {
+        if d.pdf || !xades::is_xml(&d.path) {
+            return None;
+        }
+        match self.xml_format {
+            xades::XmlFormat::Enveloped => Some(xades::Mode::Enveloped),
+            xades::XmlFormat::Detached => Some(xades::Mode::Detached),
+            xades::XmlFormat::Cades => None,
+        }
+    }
+
+    /// Enveloped: like PDFs (suffix or overwrite); detached: `name.xml.xades.xml`.
+    fn xades_output_path(&self, src: &Path, mode: xades::Mode) -> PathBuf {
+        let dir = src.parent().unwrap_or(Path::new("."));
+        let (base, ext) = match mode {
+            xades::Mode::Enveloped if self.output == Output::Overwrite => return src.to_path_buf(),
+            xades::Mode::Enveloped => (format!("{}{}", src.file_stem().unwrap_or_default().to_string_lossy(), self.suffix), "xml"),
+            xades::Mode::Detached => (src.file_name().unwrap_or_default().to_string_lossy().into_owned(), "xades.xml"),
+        };
+        let mut p = dir.join(format!("{base}.{ext}"));
+        let mut n = 2;
+        while p.exists() {
+            p = dir.join(format!("{base} ({n}).{ext}"));
+            n += 1;
+        }
+        p
+    }
+
     fn output_path(&self, src: &Path) -> PathBuf {
         if self.output == Output::Overwrite {
             return src.to_path_buf();
@@ -346,16 +383,17 @@ impl App {
         let cades_format = self.cades_format;
         let asice = cades_format == cades::Format::Asice;
         let container: Vec<(usize, PathBuf)> = if asice {
-            self.docs.iter().enumerate().filter(|(_, d)| d.checked && d.info.is_ok() && !d.pdf).map(|(i, d)| (i, d.path.clone())).collect()
+            self.docs.iter().enumerate().filter(|(_, d)| d.checked && d.info.is_ok() && !d.pdf && self.xades_mode(d).is_none()).map(|(i, d)| (i, d.path.clone())).collect()
         } else {
             Vec::new()
         };
         let container_dst = container.first().map(|(_, p)| self.cades_output_path(p));
-        let tasks: Vec<(usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>, style::Style, bool, Option<String>)> = self
+        type Task = (usize, PathBuf, PathBuf, Option<(usize, [f32; 4])>, style::Style, bool, Option<String>, Option<xades::Mode>);
+        let tasks: Vec<Task> = self
             .docs
             .iter()
             .enumerate()
-            .filter(|(_, d)| d.checked && d.info.is_ok() && (d.pdf || !asice))
+            .filter(|(_, d)| d.checked && d.info.is_ok() && (d.pdf || !asice || self.xades_mode(d).is_some()))
             .map(|(i, d)| {
                 let visible = if self.visible && d.pdf {
                     let size = self.doc_size(d);
@@ -363,8 +401,13 @@ impl App {
                 } else {
                     None
                 };
-                let dst = if d.pdf { self.output_path(&d.path) } else { self.cades_output_path(&d.path) };
-                (i, d.path.clone(), dst, visible, self.doc_style(d).clone(), d.pdf, d.password.clone())
+                let xml = self.xades_mode(d);
+                let dst = match xml {
+                    Some(mode) => self.xades_output_path(&d.path, mode),
+                    None if d.pdf => self.output_path(&d.path),
+                    None => self.cades_output_path(&d.path),
+                };
+                (i, d.path.clone(), dst, visible, self.doc_style(d).clone(), d.pdf, d.password.clone(), xml)
             })
             .collect();
         if tasks.is_empty() && container.is_empty() {
@@ -384,7 +427,7 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let signer = certs::load_signer(&cert.thumbprint);
-            for (idx, src, dst, visible, stamp_style, is_pdf, password) in tasks {
+            for (idx, src, dst, visible, stamp_style, is_pdf, password, xml_mode) in tasks {
                 let result = (|| -> anyhow::Result<PathBuf> {
                     let signer = signer.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
                     let input = std::fs::read(&src)?;
@@ -392,6 +435,13 @@ impl App {
                     let ts_ref: Option<pdf::Timestamper> = if tsa_url.is_some() { Some(&ts) } else { None };
                     let sign = |d: &[u8]| certs::sign_data(&cert.thumbprint, d, signer.alg);
                     let tmp = PathBuf::from(format!("{}.tmp", dst.display()));
+                    if let Some(mode) = xml_mode {
+                        let name = src.file_name().unwrap_or_default().to_string_lossy();
+                        let out = xades::sign(&input, &name, mode, signer, &sign, ts_ref)?;
+                        std::fs::write(&tmp, &out)?;
+                        std::fs::rename(&tmp, &dst)?;
+                        return Ok(dst);
+                    }
                     if !is_pdf {
                         let out = cades::sign(&input, cades_format, signer, &sign, ts_ref)?;
                         std::fs::write(&tmp, &out)?;
@@ -603,8 +653,13 @@ impl App {
                         (Err(e), _) => RichText::new(e).color(Color32::from_rgb(210, 60, 60)).small(),
                         (_, Status::Failed(e)) => RichText::new(e).color(Color32::from_rgb(210, 60, 60)).small(),
                         (Ok(_), _) if !doc.pdf => {
-                            let ext = self.cades_format.extension();
-                            RichText::new(t().other_file.replace("{size}", &human_size(doc.bytes)).replace("{ext}", ext)).weak().small()
+                            let size = human_size(doc.bytes);
+                            let text = match (xades::is_xml(&doc.path), self.xml_format) {
+                                (true, xades::XmlFormat::Enveloped) => t().xml_detail_enveloped.replace("{size}", &size),
+                                (true, xades::XmlFormat::Detached) => t().xml_detail_detached.replace("{size}", &size),
+                                _ => t().other_file.replace("{size}", &size).replace("{ext}", self.cades_format.extension()),
+                            };
+                            RichText::new(text).weak().small()
                         }
                         (Ok(info), _) => {
                             let mut s = t().pages.replace("{n}", &info.pages.len().to_string());
@@ -629,7 +684,7 @@ impl App {
                     if doc.locked.is_some() && ui.add_enabled(!busy, egui::Button::new(t().enter_password).small()).clicked() {
                         unlock = Some(i);
                     }
-                    let can_verify = matches!(&doc.info, Ok(info) if doc.pdf && info.signatures > 0) || verify::is_signature_file(&doc.path);
+                    let can_verify = matches!(&doc.info, Ok(info) if doc.pdf && info.signatures > 0) || doc.sig_file;
                     if can_verify && ui.add_enabled(!verifying, egui::Button::new(t().verify.verify_btn).small()).on_hover_text(t().verify.verify_tip).clicked() {
                         verify_req = Some((doc.path.clone(), doc.password.clone()));
                     }
@@ -986,6 +1041,17 @@ impl App {
                     settings::set("cades", self.cades_format.code());
                 }
             }
+            if self.docs.iter().any(|d| !d.pdf && xades::is_xml(&d.path)) {
+                ui.add_space(4.0);
+                ui.label(RichText::new(t().xml_files).strong());
+                let before = self.xml_format;
+                ui.radio_value(&mut self.xml_format, xades::XmlFormat::Enveloped, t().xades_enveloped).on_hover_text(t().xades_hint);
+                ui.radio_value(&mut self.xml_format, xades::XmlFormat::Detached, t().xades_detached).on_hover_text(t().xades_hint);
+                ui.radio_value(&mut self.xml_format, xades::XmlFormat::Cades, t().xades_as_other);
+                if self.xml_format != before {
+                    settings::set("xades", self.xml_format.code());
+                }
+            }
             ui.checkbox(&mut self.open_folder_after, t().open_folder);
 
             ui.add_space(12.0);
@@ -1037,7 +1103,10 @@ impl App {
             }
         };
         if !self.docs[sel].pdf {
-            let msg = t().no_preview_other.replace("{ext}", self.cades_format.extension());
+            let msg = match self.xades_mode(&self.docs[sel]) {
+                Some(_) => t().xades_hint.to_string(),
+                None => t().no_preview_other.replace("{ext}", self.cades_format.extension()),
+            };
             ui.centered_and_justified(|ui| ui.label(RichText::new(format!("📦\n\n{}\n\n{msg}", self.docs[sel].name())).weak().size(15.0)));
             return;
         }

@@ -72,7 +72,7 @@ fn manifest(files: &[(String, Vec<u8>)]) -> String {
     x
 }
 
-fn uri_encode(s: &str) -> String {
+pub(crate) fn uri_encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~/".contains(&b) {
@@ -84,11 +84,11 @@ fn uri_encode(s: &str) -> String {
     out
 }
 
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
-fn mime_type(name: &str) -> &'static str {
+pub(crate) fn mime_type(name: &str) -> &'static str {
     let ext = name.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
     match ext.as_str() {
         "pdf" => "application/pdf",
