@@ -28,9 +28,15 @@ impl CertInfo {
 }
 
 #[cfg(windows)]
-pub use win::{list_certificates, load_signer, sign_data};
+pub use win::{list_certificates, load_signer, root_store_certs, sign_data};
 #[cfg(not(windows))]
-pub use nix::{list_certificates, load_signer, sign_data};
+pub use nix::{list_certificates, load_signer, root_store_certs, sign_data};
+
+/// Self-signed roots the operating system trusts (read once).
+pub fn trusted_roots() -> &'static [crate::x509::Cert] {
+    static ROOTS: std::sync::OnceLock<Vec<crate::x509::Cert>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(|| root_store_certs().iter().filter_map(|d| crate::x509::parse(d)).filter(|c| c.self_issued()).collect())
+}
 
 /// Folder the certificate files are read from (Linux only).
 #[cfg(not(windows))]

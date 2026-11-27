@@ -266,6 +266,19 @@ fn cache() -> std::sync::MutexGuard<'static, HashMap<Vec<u8>, Arc<Entry>>> {
 }
 
 /// All certificate files in the folder that have a private key.
+/// Certificates of the system CA bundle (`SSL_CERT_FILE` or the usual distribution paths).
+pub fn root_store_certs() -> Vec<Vec<u8>> {
+    let candidates = [
+        std::env::var("SSL_CERT_FILE").unwrap_or_default(),
+        "/etc/ssl/certs/ca-certificates.crt".into(),
+        "/etc/pki/tls/certs/ca-bundle.crt".into(),
+        "/etc/ssl/ca-bundle.pem".into(),
+        "/etc/ssl/cert.pem".into(),
+    ];
+    let Some(pem) = candidates.iter().filter(|p| !p.is_empty()).find_map(|p| std::fs::read(p).ok()) else { return Vec::new() };
+    X509::stack_from_pem(&pem).map(|certs| certs.iter().filter_map(|c| c.to_der().ok()).collect()).unwrap_or_default()
+}
+
 pub fn list_certificates() -> Result<Vec<crate::CertInfo>> {
     cache().clear();
     let entries = iter_entries()?;

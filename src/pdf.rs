@@ -466,25 +466,181 @@ fn resolve_array(doc: &Document, o: Option<&Object>) -> Vec<Object> {
 /// Returns the RFC 3161 time-stamp token for the given signature value.
 pub type Timestamper<'a> = &'a dyn Fn(&[u8]) -> Result<Vec<u8>>;
 
+/// What goes into the new signature field.
+enum Kind<'a> {
+    /// PAdES signature (`ETSI.CAdES.detached`), optionally with a signature time-stamp.
+    Signature { req: &'a SignRequest, signer: &'a SignerCert, sign: &'a dyn Fn(&[u8]) -> Result<Vec<u8>>, timestamp: Option<Timestamper<'a>> },
+    /// Document time-stamp (`ETSI.RFC3161`, PAdES B-LTA): `tsa` returns the token for a SHA-256 digest.
+    DocTimeStamp { tsa: Timestamper<'a> },
+}
+
 pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn Fn(&[u8]) -> Result<Vec<u8>>, timestamp: Option<Timestamper>) -> Result<Vec<u8>> {
-    let doc = load(input, req.password.as_deref())?;
-    check_can_sign(&doc, req.password.as_deref())?;
+    add_signature(input, req.password.as_deref(), Kind::Signature { req, signer, sign, timestamp })
+}
+
+/// Adds an invisible document time-stamp over the whole file (PAdES B-LTA).
+pub fn add_doc_timestamp(input: &[u8], password: Option<&str>, tsa: Timestamper) -> Result<Vec<u8>> {
+    add_signature(input, password, Kind::DocTimeStamp { tsa })
+}
+
+/// CMS (DER, padding removed) of the signature or document time-stamp that covers the most bytes,
+/// i.e. the newest one.
+pub fn last_signature_cms(bytes: &[u8], password: Option<&str>) -> Result<Vec<u8>> {
+    let doc = load(bytes, password)?;
+    let covered = |d: &Dictionary| resolve_array(&doc, d.get(b"ByteRange").ok()).get(2).and_then(|o| o.as_i64().ok()).unwrap_or(0);
+    let sig = doc
+        .objects
+        .values()
+        .filter_map(|o| o.as_dict().ok())
+        .filter(|d| d.get(b"ByteRange").is_ok() && d.get(b"Contents").is_ok())
+        .max_by_key(|d| covered(d))
+        .ok_or_else(|| anyhow!("{}: /Sig", t().err_pdf_structure))?;
+    let contents = sig.get(b"Contents").and_then(|o| o.as_str()).map_err(|_| anyhow!("{}: /Contents", t().err_pdf_structure))?;
+    cms::tlv_bytes(contents).map(<[u8]>::to_vec).ok_or_else(|| anyhow!("{}: /Contents", t().err_pdf_structure))
+}
+
+/// Adds validation data to the document security store (/DSS in the catalog) as an incremental
+/// update, merging an existing /DSS (PAdES B-LT).
+pub fn add_dss(input: &[u8], password: Option<&str>, certs: &[Vec<u8>], ocsps: &[Vec<u8>], crls: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let doc = load(input, password)?;
+    let crypt = doc.encryption_state.as_ref();
+    let root_id = doc.trailer.get(b"Root").and_then(|o| o.as_reference()).map_err(|_| anyhow!("{}: /Root", t().err_pdf_structure))?;
+    let mut catalog = doc.get_dictionary(root_id).map_err(|_| anyhow!("{}: /Catalog", t().err_pdf_structure))?.clone();
+    let existing = catalog.get(b"DSS").ok().and_then(|o| doc.dereference(o).ok()).and_then(|(_, o)| o.as_dict().ok().cloned()).unwrap_or_default();
+    let mut next_id = first_id(&doc);
+    let mut objects = Vec::new();
+    let mut dss = Dictionary::new();
+    for (key, items) in [("Certs", certs), ("OCSPs", ocsps), ("CRLs", crls)] {
+        let mut refs = resolve_array(&doc, existing.get(key.as_bytes()).ok());
+        for data in items {
+            let id = (next_id, 0);
+            next_id += 1;
+            objects.push((id, seal(crypt, id, stream(Dictionary::new(), data, true))?));
+            refs.push(Object::Reference(id));
+        }
+        if !refs.is_empty() {
+            dss.set(key, refs);
+        }
+    }
+    let dss_id = (next_id, 0);
+    next_id += 1;
+    objects.push((dss_id, seal(crypt, dss_id, Object::Dictionary(dss))?));
+    catalog.set("DSS", Object::Reference(dss_id));
+    objects.push((root_id, seal(crypt, root_id, Object::Dictionary(catalog))?));
+    let encrypt = encrypt_ref(crypt, &mut next_id, &mut objects)?;
+    Ok(write_update(input, &doc, &objects, &mut next_id, encrypt)?.0)
+}
+
+/// Encrypts `o` with the key of object `id` when the document is encrypted, then serializes it.
+fn seal(crypt: Option<&lopdf::EncryptionState>, id: ObjectId, mut o: Object) -> Result<Vec<u8>> {
+    if let Some(state) = crypt {
+        lopdf::encryption::encrypt_object(state, id, &mut o).map_err(|e| anyhow!("{}: {e}", t().err_pdf_structure))?;
+    }
+    Ok(obj_bytes(&o))
+}
+
+/// The /Encrypt reference for the new trailer: the existing object, or a direct dictionary (rare)
+/// written as a new indirect object.
+fn encrypt_ref(crypt: Option<&lopdf::EncryptionState>, next_id: &mut u32, objects: &mut Vec<(ObjectId, Vec<u8>)>) -> Result<Option<ObjectId>> {
+    let Some(state) = crypt else { return Ok(None) };
+    if let Some(id) = state.encrypt_object_id() {
+        return Ok(Some(id));
+    }
+    let id = (*next_id, 0);
+    *next_id += 1;
+    let dict = state.encode().map_err(|e| anyhow!("{}: /Encrypt: {e}", t().err_pdf_structure))?;
+    objects.push((id, obj_bytes(&Object::Dictionary(dict))));
+    Ok(Some(id))
+}
+
+/// Appends `objects` as an incremental update, with an xref table or stream like the previous
+/// section. Returns the new file and the offset of every object's body (after `N G obj`).
+fn write_update(input: &[u8], doc: &Document, objects: &[(ObjectId, Vec<u8>)], next_id: &mut u32, encrypt: Option<ObjectId>) -> Result<(Vec<u8>, HashMap<ObjectId, usize>)> {
+    let prev_xref = startxref(input)?;
+    let prev_is_stream = !input[prev_xref..].iter().skip_while(|c| c.is_ascii_whitespace()).take(4).eq(b"xref".iter());
+    let root_id = doc.trailer.get(b"Root").and_then(|o| o.as_reference()).map_err(|_| anyhow!("{}: /Root", t().err_pdf_structure))?;
+
+    let mut out = input.to_vec();
+    if !matches!(out.last(), Some(b'\n') | Some(b'\r')) {
+        out.push(b'\n');
+    }
+    let mut offsets: Vec<(ObjectId, usize)> = Vec::new();
+    let mut bodies = HashMap::new();
+    for (id, body) in objects {
+        offsets.push((*id, out.len()));
+        write!(out, "{} {} obj\n", id.0, id.1).unwrap();
+        bodies.insert(*id, out.len());
+        out.extend_from_slice(body);
+        out.extend_from_slice(b"\nendobj\n");
+    }
+
+    let mut trailer = Dictionary::new();
+    trailer.set("Root", Object::Reference(root_id));
+    for key in [&b"Info"[..], b"ID"] {
+        if let Ok(v) = doc.trailer.get(key) {
+            trailer.set(key.to_vec(), v.clone());
+        }
+    }
+    trailer.set("Prev", prev_xref as i64);
+    if let Some(id) = encrypt {
+        trailer.set("Encrypt", Object::Reference(id));
+    }
+
+    let xref_off;
+    if prev_is_stream {
+        let xref_id = (*next_id, 0u16);
+        *next_id += 1;
+        xref_off = out.len();
+        offsets.push((xref_id, xref_off));
+        offsets.sort();
+        let mut rows = Vec::new();
+        let mut index = Vec::new();
+        for (id, off) in &offsets {
+            rows.push(1u8);
+            rows.extend_from_slice(&(*off as u32).to_be_bytes());
+            rows.extend_from_slice(&id.1.to_be_bytes());
+            index.push(Object::Integer(id.0 as i64));
+            index.push(Object::Integer(1));
+        }
+        trailer.set("Type", Object::Name(b"XRef".to_vec()));
+        trailer.set("Size", *next_id as i64);
+        trailer.set("W", Object::Array(vec![1.into(), 4.into(), 2.into()]));
+        trailer.set("Index", index);
+        write!(out, "{} 0 obj\n", xref_id.0).unwrap();
+        out.extend(stream_obj(trailer, &rows, false));
+        out.extend_from_slice(b"\nendobj\n");
+    } else {
+        xref_off = out.len();
+        offsets.sort();
+        out.extend_from_slice(b"xref\n");
+        for (id, off) in &offsets {
+            write!(out, "{} 1\n{:010} {:05} n\r\n", id.0, off, id.1).unwrap();
+        }
+        trailer.set("Size", *next_id as i64);
+        out.extend_from_slice(b"trailer\n");
+        write_dict(&mut out, &trailer);
+        out.push(b'\n');
+    }
+    write!(out, "startxref\n{xref_off}\n%%EOF\n").unwrap();
+    Ok((out, bodies))
+}
+
+fn first_id(doc: &Document) -> u32 {
+    let trailer_size = doc.trailer.get(b"Size").and_then(|o| o.as_i64()).unwrap_or(0) as u32;
+    trailer_size.max(doc.max_id + 1)
+}
+
+fn add_signature(input: &[u8], password: Option<&str>, kind: Kind) -> Result<Vec<u8>> {
+    let doc = load(input, password)?;
+    check_can_sign(&doc, password)?;
     // New and rewritten objects of an encrypted file are encrypted with their own object key
     // (ISO 32000-2, 7.6.2); the signature's /Contents and the xref stream stay plain.
     let crypt = doc.encryption_state.as_ref();
-    let seal = |id: ObjectId, mut o: Object| -> Result<Vec<u8>> {
-        if let Some(state) = crypt {
-            lopdf::encryption::encrypt_object(state, id, &mut o).map_err(|e| anyhow!("{}: {e}", t().err_pdf_structure))?;
-        }
-        Ok(obj_bytes(&o))
-    };
-    let prev_xref = startxref(input)?;
-    let prev_is_stream = !input[prev_xref..].iter().skip_while(|c| c.is_ascii_whitespace()).take(4).eq(b"xref".iter());
+    let seal = |id: ObjectId, o: Object| seal(crypt, id, o);
 
     let root_id = doc.trailer.get(b"Root").and_then(|o| o.as_reference()).map_err(|_| anyhow!("{}: /Root", t().err_pdf_structure))?;
     let mut catalog = doc.get_dictionary(root_id).map_err(|_| anyhow!("{}: /Catalog", t().err_pdf_structure))?.clone();
-    let trailer_size = doc.trailer.get(b"Size").and_then(|o| o.as_i64()).unwrap_or(0) as u32;
-    let mut next_id = trailer_size.max(doc.max_id + 1);
+    let mut next_id = first_id(&doc);
     let mut alloc = || {
         let id = (next_id, 0u16);
         next_id += 1;
@@ -495,18 +651,23 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::new();
 
     // Unique field name.
-    let names: BTreeSet<Vec<u8>> = doc
+    // Compare decoded names: /T is often UTF-16BE (ours is), so raw bytes would never match.
+    let names: BTreeSet<String> = doc
         .objects
         .values()
         .filter_map(|o| o.as_dict().ok())
-        .filter_map(|d| d.get(b"T").ok().and_then(|t| t.as_str().ok()).map(|t| t.to_vec()))
+        .filter_map(|d| d.get(b"T").ok().and_then(|t| t.as_str().ok()).map(pdf_text))
         .collect();
-    let field_name = (1..).map(|n| format!("Signature{n}")).find(|n| !names.contains(n.as_bytes())).unwrap();
+    let field_name = (1..).map(|n| format!("Signature{n}")).find(|n| !names.contains(n)).unwrap();
 
     let sig_id = alloc();
     let widget_id = alloc();
 
-    let page_idx = req.visible.as_ref().map_or(0, |v| v.page.min(pages.len() - 1));
+    let visible = match &kind {
+        Kind::Signature { req, .. } => req.visible.as_ref(),
+        Kind::DocTimeStamp { .. } => None,
+    };
+    let page_idx = visible.map_or(0, |v| v.page.min(pages.len() - 1));
     let (page_id, geom) = pages[page_idx];
 
     let mut widget = Dictionary::new();
@@ -518,7 +679,7 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     widget.set("F", 132i64);
     widget.set("P", Object::Reference(page_id));
 
-    match &req.visible {
+    match visible {
         Some(v) => {
             let r = v.rect;
             let user = geom.display_rect_to_user(r);
@@ -605,27 +766,35 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     }
 
     // Signature dictionary with placeholders.
-    // A time-stamp token carries the TSA's certificate chain.
-    let ts_room = if timestamp.is_some() { 24_000 } else { 0 };
-    let contents_len = (signer.chain.iter().map(|c| c.len()).sum::<usize>() + 6000 + ts_room) * 2;
     let mut sig = Vec::new();
-    sig.extend_from_slice(b"<</Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached");
-    let m = req.time.format("D:%Y%m%d%H%M%S%:z").to_string();
-    let m = format!("{}'{}'", &m[..m.len() - 3], &m[m.len() - 2..]);
-    let strings = [
-        ("Name", text(req.signer_name.trim())),
-        ("Reason", text(req.reason.trim())),
-        ("Location", text(req.location.trim())),
-        ("ContactInfo", text(req.contact.trim())),
-        ("M", Object::String(m.into_bytes(), lopdf::StringFormat::Literal)),
-    ];
-    for (key, val) in strings {
-        if matches!(&val, Object::String(s, _) if s.len() <= 2 && key != "M") {
-            continue;
+    let contents_len = match &kind {
+        Kind::Signature { req, signer, timestamp, .. } => {
+            sig.extend_from_slice(b"<</Type /Sig /Filter /Adobe.PPKLite /SubFilter /ETSI.CAdES.detached");
+            let m = req.time.format("D:%Y%m%d%H%M%S%:z").to_string();
+            let m = format!("{}'{}'", &m[..m.len() - 3], &m[m.len() - 2..]);
+            let strings = [
+                ("Name", text(req.signer_name.trim())),
+                ("Reason", text(req.reason.trim())),
+                ("Location", text(req.location.trim())),
+                ("ContactInfo", text(req.contact.trim())),
+                ("M", Object::String(m.into_bytes(), lopdf::StringFormat::Literal)),
+            ];
+            for (key, val) in strings {
+                if matches!(&val, Object::String(s, _) if s.len() <= 2 && key != "M") {
+                    continue;
+                }
+                write!(sig, " /{key} ").unwrap();
+                sig.extend(seal(sig_id, val)?);
+            }
+            // A time-stamp token carries the TSA's certificate chain.
+            let ts_room = if timestamp.is_some() { 24_000 } else { 0 };
+            (signer.chain.iter().map(|c| c.len()).sum::<usize>() + 6000 + ts_room) * 2
         }
-        write!(sig, " /{key} ").unwrap();
-        sig.extend(seal(sig_id, val)?);
-    }
+        Kind::DocTimeStamp { .. } => {
+            sig.extend_from_slice(b"<</Type /DocTimeStamp /Filter /Adobe.PPKLite /SubFilter /ETSI.RFC3161");
+            24_000 * 2
+        }
+    };
     sig.extend_from_slice(b" /ByteRange ");
     let br_off = sig.len();
     sig.extend_from_slice(b"[0 0000000000 0000000000 0000000000]");
@@ -638,84 +807,9 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     sig.extend_from_slice(b">>");
     objects.push((sig_id, sig));
 
-    // The existing /Encrypt dictionary is reused; a direct one (rare) becomes an indirect object.
-    let encrypt_ref = match crypt {
-        Some(state) => Some(match state.encrypt_object_id() {
-            Some(id) => id,
-            None => {
-                let id = alloc();
-                let dict = state.encode().map_err(|e| anyhow!("{}: /Encrypt: {e}", t().err_pdf_structure))?;
-                objects.push((id, obj_bytes(&Object::Dictionary(dict))));
-                id
-            }
-        }),
-        None => None,
-    };
-
-    // Assemble the incremental update.
-    let mut out = input.to_vec();
-    if !matches!(out.last(), Some(b'\n') | Some(b'\r')) {
-        out.push(b'\n');
-    }
-    let mut offsets: Vec<(ObjectId, usize)> = Vec::new();
-    let mut sig_body_off = 0;
-    for (id, body) in &objects {
-        offsets.push((*id, out.len()));
-        write!(out, "{} {} obj\n", id.0, id.1).unwrap();
-        if *id == sig_id {
-            sig_body_off = out.len();
-        }
-        out.extend_from_slice(body);
-        out.extend_from_slice(b"\nendobj\n");
-    }
-
-    let mut trailer = Dictionary::new();
-    trailer.set("Root", Object::Reference(root_id));
-    for key in [&b"Info"[..], b"ID"] {
-        if let Ok(v) = doc.trailer.get(key) {
-            trailer.set(key.to_vec(), v.clone());
-        }
-    }
-    trailer.set("Prev", prev_xref as i64);
-    if let Some(id) = encrypt_ref {
-        trailer.set("Encrypt", Object::Reference(id));
-    }
-
-    let xref_off;
-    if prev_is_stream {
-        let xref_id = alloc();
-        xref_off = out.len();
-        offsets.push((xref_id, xref_off));
-        offsets.sort();
-        let mut rows = Vec::new();
-        let mut index = Vec::new();
-        for (id, off) in &offsets {
-            rows.push(1u8);
-            rows.extend_from_slice(&(*off as u32).to_be_bytes());
-            rows.extend_from_slice(&id.1.to_be_bytes());
-            index.push(Object::Integer(id.0 as i64));
-            index.push(Object::Integer(1));
-        }
-        trailer.set("Type", Object::Name(b"XRef".to_vec()));
-        trailer.set("Size", next_id as i64);
-        trailer.set("W", Object::Array(vec![1.into(), 4.into(), 2.into()]));
-        trailer.set("Index", index);
-        write!(out, "{} 0 obj\n", xref_id.0).unwrap();
-        out.extend(stream_obj(trailer, &rows, false));
-        out.extend_from_slice(b"\nendobj\n");
-    } else {
-        xref_off = out.len();
-        offsets.sort();
-        out.extend_from_slice(b"xref\n");
-        for (id, off) in &offsets {
-            write!(out, "{} 1\n{:010} {:05} n\r\n", id.0, off, id.1).unwrap();
-        }
-        trailer.set("Size", next_id as i64);
-        out.extend_from_slice(b"trailer\n");
-        write_dict(&mut out, &trailer);
-        out.push(b'\n');
-    }
-    write!(out, "startxref\n{xref_off}\n%%EOF\n").unwrap();
+    let encrypt = encrypt_ref(crypt, &mut next_id, &mut objects)?;
+    let (mut out, bodies) = write_update(input, &doc, &objects, &mut next_id, encrypt)?;
+    let sig_body_off = bodies[&sig_id];
 
     // Fill ByteRange, hash, sign, embed CMS.
     let c_start = sig_body_off + contents_off;
@@ -732,13 +826,18 @@ pub fn sign_pdf(input: &[u8], req: &SignRequest, signer: &SignerCert, sign: &dyn
     h.update(&out[c_end..]);
     let doc_digest = h.finalize();
 
-    let attrs = cms::signed_attributes(&doc_digest, &signer.der);
-    let signature = sign(&attrs)?;
-    let token = match timestamp {
-        Some(ts) => Some(ts(&cms::signature_value(&signature, signer.alg))?),
-        None => None,
+    let cms_der = match kind {
+        Kind::Signature { signer, sign, timestamp, .. } => {
+            let attrs = cms::signed_attributes(&doc_digest, &signer.der);
+            let signature = sign(&attrs)?;
+            let token = match timestamp {
+                Some(ts) => Some(ts(&cms::signature_value(&signature, signer.alg))?),
+                None => None,
+            };
+            cms::build_signed_data(&attrs, &signature, signer, token.as_deref())
+        }
+        Kind::DocTimeStamp { tsa } => tsa(&doc_digest)?,
     };
-    let cms_der = cms::build_signed_data(&attrs, &signature, signer, token.as_deref());
     let hex: String = cms_der.iter().map(|b| format!("{b:02X}")).collect();
     if hex.len() > contents_len {
         bail!(t().err_sig_too_big);
@@ -871,6 +970,18 @@ mod tests {
     }
 
     #[test]
+    fn signing_twice_gives_unique_field_names() {
+        let signer = SignerCert { der: vec![0x30, 0], issuer_der: vec![0x30, 0], serial_be: vec![1], chain: vec![vec![0x30, 0]], alg: cms::KeyAlg::Rsa };
+        let req = SignRequest { signer_name: "x".into(), reason: String::new(), location: String::new(), contact: String::new(), time: Local::now(), visible: None, password: None };
+        let once = sign_pdf(include_bytes!("../tests/fixtures/minimal.pdf"), &req, &signer, &|_| Ok(vec![0u8; 256]), None).unwrap();
+        let twice = sign_pdf(&once, &req, &signer, &|_| Ok(vec![0u8; 256]), None).unwrap();
+        let doc = load(&twice, None).unwrap();
+        let mut names: Vec<String> = sig_fields(&doc).filter_map(|d| d.get(b"T").ok()?.as_str().ok().map(pdf_text)).collect();
+        names.sort();
+        assert_eq!(names, ["Signature1", "Signature2"]);
+    }
+
+    #[test]
     fn rotation_maps_display_rect_to_user_space() {
         let g = PageGeom { crop: [0.0, 0.0, 600.0, 800.0], rotate: 0 };
         assert_eq!(g.display_rect_to_user([10.0, 20.0, 100.0, 50.0]), [10.0, 730.0, 110.0, 780.0]);
@@ -934,8 +1045,19 @@ mod tests {
         let tsa = std::env::var("DOC_SIGNER_TSA").ok();
         let ts = |v: &[u8]| crate::tsa::timestamp(tsa.as_deref().unwrap(), v).map(|t| t.token);
         let ts_ref: Option<Timestamper> = if tsa.is_some() { Some(&ts) } else { None };
-        let out = sign_pdf(&bytes, &req, &signer, &|d| crate::certs::sign_data(&thumb, d, signer.alg), ts_ref).unwrap();
+        let mut out = sign_pdf(&bytes, &req, &signer, &|d| crate::certs::sign_data(&thumb, d, signer.alg), ts_ref).unwrap();
+        // Optional DOC_SIGNER_LTV=1 (B-LT) / DOC_SIGNER_LTA=1 (B-LTA, with DOC_SIGNER_TSA).
+        if std::env::var("DOC_SIGNER_LTV").is_ok() || std::env::var("DOC_SIGNER_LTA").is_ok() {
+            let archive = std::env::var("DOC_SIGNER_LTA").is_ok().then(|| tsa.clone().expect("DOC_SIGNER_LTA needs DOC_SIGNER_TSA"));
+            let (extended, warnings) = crate::ltv::extend(&out, password.as_deref(), archive.as_deref(), &crate::ltv::Http).unwrap();
+            for w in &warnings {
+                eprintln!("LTV warning: {w}");
+            }
+            assert!(warnings.is_empty(), "complete validation data expected");
+            out = extended;
+        }
         std::fs::write(format!("{input}.signed.pdf"), &out).unwrap();
-        assert_eq!(inspect(&out, password.as_deref()).unwrap().signatures, info.signatures + 1);
+        let doc_timestamps = usize::from(std::env::var("DOC_SIGNER_LTA").is_ok());
+        assert_eq!(inspect(&out, password.as_deref()).unwrap().signatures, info.signatures + 1 + doc_timestamps);
     }
 }

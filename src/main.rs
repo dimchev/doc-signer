@@ -5,6 +5,7 @@ mod cades;
 mod certs;
 mod i18n;
 mod image_src;
+mod ltv;
 mod cms;
 mod fonts;
 mod pdf;
@@ -14,6 +15,7 @@ mod stamp;
 mod style;
 mod style_ui;
 mod tsa;
+mod x509;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -92,11 +94,13 @@ enum Output {
 enum Level {
     Info,
     Ok,
+    Warn,
     Err,
 }
 
 enum JobMsg {
     Done(usize, Result<PathBuf, String>),
+    Warn(String),
     Finished,
 }
 
@@ -116,6 +120,9 @@ struct App {
     /// Add an RFC 3161 time-stamp (PAdES B-T) from `tsa_url`.
     use_tsa: bool,
     tsa_url: String,
+    /// With the TSA: add validation data (B-LT) and an archive time-stamp (B-LTA).
+    use_ltv: bool,
+    use_lta: bool,
     /// Signature format for non-PDF files.
     cades_format: cades::Format,
     styles: style_ui::StyleUi,
@@ -149,6 +156,8 @@ impl App {
             contact: String::new(),
             visible: true,
             use_tsa: settings::get("tsa").as_deref() == Some("1"),
+            use_ltv: settings::get("ltv").as_deref() == Some("1"),
+            use_lta: settings::get("lta").as_deref() == Some("1"),
             tsa_url: settings::get("tsa_url").filter(|u| !u.trim().is_empty()).unwrap_or_else(|| tsa::DEFAULT_URL.into()),
             cades_format: cades::Format::from_code(settings::get("cades").as_deref().unwrap_or("p7s")),
             styles: style_ui::StyleUi::new(),
@@ -364,6 +373,7 @@ impl App {
         self.job = Some(rx);
         let (reason, location, contact) = (self.reason.clone(), self.location.clone(), self.contact.clone());
         let tsa_url = self.use_tsa.then(|| self.tsa_url.trim().to_string());
+        let (use_ltv, use_lta) = (self.use_tsa && self.use_ltv, self.use_tsa && self.use_ltv && self.use_lta);
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let signer = certs::load_signer(&cert.thumbprint);
@@ -400,9 +410,24 @@ impl App {
                         contact: contact.clone(),
                         time,
                         visible,
-                        password,
+                        password: password.clone(),
                     };
-                    let out = pdf::sign_pdf(&input, &req, signer, &sign, ts_ref)?;
+                    let mut out = pdf::sign_pdf(&input, &req, signer, &sign, ts_ref)?;
+                    if use_ltv {
+                        let name = src.file_name().unwrap_or_default().to_string_lossy();
+                        let archive = use_lta.then(|| tsa_url.as_deref().unwrap_or(tsa::DEFAULT_URL));
+                        match ltv::extend(&out, password.as_deref(), archive, &ltv::Http) {
+                            Ok((extended, warnings)) => {
+                                out = extended;
+                                for w in warnings {
+                                    let _ = tx.send(JobMsg::Warn(format!("{name}: {w}")));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(JobMsg::Warn(format!("{name}: {}: {e:#}", t().ltv_failed)));
+                            }
+                        }
+                    }
                     std::fs::write(&tmp, &out)?;
                     std::fs::rename(&tmp, &dst)?;
                     Ok(dst)
@@ -456,6 +481,7 @@ impl App {
                         doc.checked = false;
                     }
                 }
+                JobMsg::Warn(w) => self.push(Level::Warn, w),
                 JobMsg::Done(i, Err(e)) => {
                     let name = self.docs.get(i).map(|d| d.name()).unwrap_or_default();
                     self.push(Level::Err, format!("{name}: {e}"));
@@ -767,6 +793,20 @@ impl App {
                         settings::set("tsa_url", self.tsa_url.trim());
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.add_space(22.0);
+                    if ui.checkbox(&mut self.use_ltv, t().ltv_enable).on_hover_text(t().ltv_hint).changed() {
+                        settings::set("ltv", if self.use_ltv { "1" } else { "0" });
+                    }
+                });
+                ui.add_enabled_ui(self.use_ltv, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.add_space(44.0);
+                        if ui.checkbox(&mut self.use_lta, t().lta_enable).on_hover_text(t().lta_hint).changed() {
+                            settings::set("lta", if self.use_lta { "1" } else { "0" });
+                        }
+                    });
+                });
             });
 
             ui.separator();
@@ -1055,6 +1095,7 @@ impl App {
                 let color = match level {
                     Level::Info => ui.visuals().text_color(),
                     Level::Ok => Color32::from_rgb(40, 170, 80),
+                Level::Warn => Color32::from_rgb(220, 150, 0),
                     Level::Err => Color32::from_rgb(210, 60, 60),
                 };
                 ui.label(RichText::new(msg).color(color).monospace().small());
